@@ -36,3 +36,58 @@ the problem occurs.
 ---
 
 ## Architecture
+---
+
+## Who Uses This
+
+| User | Problem solved |
+|------|---------------|
+| Grid operators (SLDC) | 24-hour solar forecast for grid balancing |
+| Utility companies (DISCOM) | Reduce CERC deviation settlement penalties |
+| Solar plant owners (IPP) | Accurate scheduling to minimize penalties |
+| Battery storage operators | Optimal charge/discharge scheduling |
+
+---
+
+## Project Status
+
+| Phase | What | Status |
+|-------|------|--------|
+| 0 | Environment · data pipeline · simulator | ✅ Complete |
+| 1 | EDA · data quality · pattern analysis | ✅ Complete |
+| 2 | Feature engineering | 🔄 In progress |
+| 3 | XGBoost + LSTM + Prophet models + MLflow | ⏳ Next |
+| 4 | Optimization engine | ⏳ Planned |
+| 5 | FastAPI + Streamlit dashboard | ⏳ Planned |
+| 6 | Docker + GCP deployment | ⏳ Planned |
+
+---
+
+## Key Findings from EDA (Phase 1)
+
+- **Irradiance is the dominant driver** — correlation of 1.0 with 
+  solar output. The single most important feature.
+- **Hour of day matters most** — daily bell curve peaks at 11–12 PM 
+  solar noon over Jaipur.
+- **Seasonal trend confirmed** — output increases ~1.5 MW/month 
+  from January toward summer.
+- **Cloud cover effect** — real but requires full-year data including 
+  monsoon months to measure accurately.
+- **Wind speed irrelevant** — 0.05 correlation. Excluded from features.
+
+---
+
+## Tech Stack
+
+| Layer | Tools |
+|-------|-------|
+| Data | Python · Pandas · NumPy · PyArrow |
+| Weather API | Open-Meteo · NASA POWER |
+| Models | XGBoost · TensorFlow/Keras · Prophet |
+| Tracking | MLflow |
+| Orchestration | Apache Airflow |
+| API | FastAPI |
+| Dashboard | Streamlit |
+| Infrastructure | Docker · GCP |
+
+---
