@@ -1,0 +1,82 @@
+# ============================================================
+# Solar Forecast Platform — Master Configuration
+# ============================================================
+# All tuneable settings live here. Code reads from this file.
+# Never hardcode coordinates, URLs, or thresholds in .py files.
+
+project:
+  name: "Solar Forecast Platform"
+  version: "0.1.0"
+  location: "Jaipur, Rajasthan"
+  timezone: "Asia/Kolkata"
+
+# Target location for MVP
+location:
+  name: "Jaipur"
+  state: "Rajasthan"
+  latitude: 26.9124
+  longitude: 75.7873
+  elevation_m: 431
+  # Rajasthan has one of the highest solar irradiance levels in India
+  # Annual GHI: ~5.5 - 6.0 kWh/m²/day — ideal for solar forecasting MVP
+
+# Data sources
+data_sources:
+  open_meteo:
+    base_url: "https://api.open-meteo.com/v1/forecast"
+    # No API key required — fully free, production-grade weather API
+    historical_url: "https://archive-api.open-meteo.com/v1/archive"
+
+  nasa_power:
+    base_url: "https://power.larc.nasa.gov/api/temporal/hourly/point"
+    # No API key required for hourly data pulls
+
+# Weather variables to fetch (Open-Meteo variable names)
+weather_variables:
+  hourly:
+    - "temperature_2m"           # Air temp at 2m height (°C)
+    - "relative_humidity_2m"     # Humidity (%) — affects panel cooling
+    - "precipitation"            # Rain (mm) — proxy for cloud cover
+    - "cloud_cover"              # Total cloud cover (%) — primary predictor
+    - "wind_speed_10m"           # Wind speed at 10m (m/s)
+    - "shortwave_radiation"      # GHI — Global Horizontal Irradiance (W/m²)
+    - "direct_radiation"         # Direct Normal Irradiance (W/m²)
+    - "diffuse_radiation"        # Diffuse radiation (W/m²)
+
+# Forecasting settings
+forecasting:
+  horizons_hours: [1, 6, 24]    # Forecast horizons we produce
+  interval_minutes: 15           # Granularity of forecasts
+  training_window_days: 90       # Rolling window for model training
+  confidence_levels: [0.10, 0.50, 0.90]  # Quantiles for uncertainty
+
+# Solar plant parameters (simulated for MVP)
+solar_plant:
+  capacity_mw: 100               # Simulated 100 MW plant
+  panel_efficiency: 0.20         # 20% — modern monocrystalline panels
+  temperature_coefficient: -0.004  # -0.4%/°C above 25°C (typical)
+  performance_ratio: 0.80        # Real-world losses (wiring, dust, inverter)
+  panel_area_m2: 500000          # Panel area for 100MW at 20% efficiency
+
+# Data pipeline settings
+pipeline:
+  raw_data_retention_days: 365
+  processed_data_retention_days: 730
+  fetch_timeout_seconds: 30
+  max_retries: 3
+  retry_delay_seconds: 5
+
+# Logging
+logging:
+  level: "INFO"
+  format: "{time:YYYY-MM-DD HH:mm:ss} | {level} | {module} | {message}"
+  file: "logs/solar_platform.log"
+
+# Validation thresholds
+validation:
+  max_temperature_c: 55.0        # Jaipur summer max reasonable value
+  min_temperature_c: -5.0
+  max_irradiance_wm2: 1200.0     # Physical maximum at surface
+  min_irradiance_wm2: 0.0
+  max_cloud_cover_pct: 100.0
+  max_missing_pct: 0.05          # Fail if >5% of a fetch is null

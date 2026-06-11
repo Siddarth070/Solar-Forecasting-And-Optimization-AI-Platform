@@ -1,0 +1,22 @@
+# Virtual environment
+venv/
+__pycache__/
+*.pyc
+.DS_Store
+
+# Data files — too large for GitHub
+data/raw/
+data/processed/
+data/features/
+
+# Environment variables
+.env
+
+# Jupyter checkpoints
+.ipynb_checkpoints/
+
+# MLflow
+mlruns/
+
+# Logs
+logs/
