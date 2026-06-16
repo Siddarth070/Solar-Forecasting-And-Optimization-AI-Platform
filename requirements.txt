@@ -23,21 +23,21 @@ pydantic>=2.0.0
 # ── ML models (Phase 3) ─────────────────────────────────────
 scikit-learn>=1.3.0
 xgboost>=1.7.0
-# tensorflow>=2.13.0     # Uncomment when starting LSTM (Phase 3)
-# prophet>=1.1.4         # Uncomment when starting Prophet (Phase 3)
+#tensorflow>=2.13.0     # Uncomment when starting LSTM (Phase 3)
+ prophet>=1.1.4         # Uncomment when starting Prophet (Phase 3)
 
 # ── Experiment tracking (Phase 3) ───────────────────────────
-# mlflow>=2.7.0          # Uncomment in Phase 3
+#mlflow>=2.7.0          # Uncomment in Phase 3
 
 # ── Orchestration (Phase 5) ─────────────────────────────────
-# apache-airflow>=2.7.0  # Install separately — has complex deps
+apache-airflow>=2.7.0  # Install separately — has complex deps
 
 # ── API layer (Phase 5) ─────────────────────────────────────
-# fastapi>=0.103.0       # Uncomment in Phase 5
-# uvicorn>=0.23.0
+fastapi>=0.103.0       # Uncomment in Phase 5
+uvicorn>=0.23.0
 
 # ── Dashboard (Phase 5) ─────────────────────────────────────
-# streamlit>=1.27.0      # Uncomment in Phase 5
+streamlit>=1.27.0      # Uncomment in Phase 5
 
 # ── Testing ─────────────────────────────────────────────────
 pytest>=7.4.0
@@ -46,3 +46,20 @@ pytest-cov>=4.1.0
 # ── Development utilities ────────────────────────────────────
 jupyter>=1.0.0
 ipykernel>=6.25.0
+
+pandas>=2.0.0
+numpy>=1.24.0
+pyarrow>=12.0.0
+requests>=2.31.0
+pyyaml>=6.0.0
+python-dotenv>=1.0.0
+loguru>=0.7.0
+pydantic>=2.0.0
+scikit-learn>=1.3.0
+xgboost>=1.7.0
+pulp
+streamlit
+plotly
+fastapi>=0.103.0
+uvicorn>=0.23.0
+pytest>=7.4.0
