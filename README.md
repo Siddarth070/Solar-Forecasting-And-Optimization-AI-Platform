@@ -129,3 +129,7 @@ pytest tests/ -v
 *Built as a portfolio project demonstrating end-to-end ML engineering for the Indian
 energy sector. Target location: Jaipur, Rajasthan (one of India's highest solar
 irradiance regions, ~5.5–6.0 kWh/m²/day annual GHI).*
+
+
+## Live Demo
+👉 [Open Dashboard](https://zenith-to.streamlit.app/)
