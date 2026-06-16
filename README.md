@@ -132,4 +132,4 @@ irradiance regions, ~5.5–6.0 kWh/m²/day annual GHI).*
 
 
 ## Live Demo
-👉 [Open Dashboard](https://solar-forecast-ai.streamlit.app/)
+👉 [Open Dashboard](https://zenith-to.streamlit.app/)
