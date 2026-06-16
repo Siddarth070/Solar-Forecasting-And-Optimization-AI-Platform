@@ -369,3 +369,4 @@ st.success("✅ Optimization complete — dispatch schedule ready")
 st.caption(
     f"Zenith v1.0 | "
     f"Built by Siddharth Agrawal | "
+)
