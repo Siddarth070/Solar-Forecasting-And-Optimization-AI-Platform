@@ -23,8 +23,8 @@ sys.path.insert(0, str(PROJECT_ROOT))
 
 # ── Page config ───────────────────────────────────────────────
 st.set_page_config(
-    page_title="Solar Forecast Platform — Jaipur",
-    page_icon="☀️",
+    page_title="Zenith — Solar Intelligence Platform",
+    page_icon="🌤️",
     layout="wide"
 )
 
@@ -194,8 +194,8 @@ def run_optimization(solar_forecast, demand_forecast,
 # ══════════════════════════════════════════════════════════════
 
 # Header
-st.title("☀️ Solar Forecast Platform")
-st.caption("Jaipur, Rajasthan — AI-based solar generation forecasting and grid optimization")
+st.title("⚡ Zenith")
+st.caption("Peak solar intelligence for India's grid — Jaipur, Rajasthan")
 
 # Model status
 if model_loaded:
@@ -366,10 +366,6 @@ if min_battery < 5:
 st.success("✅ Optimization complete — dispatch schedule ready")
 
 # Footer
-st.divider()
 st.caption(
-    f"Solar Forecast Platform v1.0 | "
+    f"Zenith v1.0 | "
     f"Built by Siddharth Agrawal | "
-    f"Jaipur, Rajasthan, India | "
-    f"Model: XGBoost | MAPE: 2.17%"
-)
