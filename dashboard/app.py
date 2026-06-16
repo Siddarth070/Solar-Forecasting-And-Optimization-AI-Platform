@@ -31,13 +31,23 @@ st.set_page_config(
 # ── Load model ────────────────────────────────────────────────
 @st.cache_resource
 def load_model():
-    """Load XGBoost model — cached so it loads once."""
-    model_path = PROJECT_ROOT / "src" / "models" / "xgboost_solar_v2.pkl"
-    try:
-        with open(model_path, "rb") as f:
-            return pickle.load(f), True
-    except FileNotFoundError:
-        return None, False
+    """Load XGBoost model — tries multiple paths for local and Docker."""
+    possible_paths = [
+        Path(__file__).resolve().parent / "src" / "models" / "xgboost_solar_v2.pkl",
+        Path("/app/src/models/xgboost_solar_v2.pkl"),
+        Path("src/models/xgboost_solar_v2.pkl"),
+        Path(__file__).resolve().parent.parent / "src" / "models" / "xgboost_solar_v2.pkl",
+    ]
+
+    for path in possible_paths:
+        if path.exists():
+            try:
+                with open(path, "rb") as f:
+                    return pickle.load(f), True
+            except Exception:
+                continue
+
+    return None, False
 
 model, model_loaded = load_model()
 

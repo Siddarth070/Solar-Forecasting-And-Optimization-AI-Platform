@@ -1,0 +1,10 @@
+venv/
+__pycache__/
+*.pyc
+.git/
+.env
+notebooks/
+*.ipynb
+mlruns/
+logs/
+.DS_Store
