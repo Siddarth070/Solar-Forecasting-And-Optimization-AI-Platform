@@ -9,3 +9,4 @@ data/features/
 .ipynb_checkpoints/
 mlruns/
 logs/
+.idea/

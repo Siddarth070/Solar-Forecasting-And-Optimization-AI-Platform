@@ -23,43 +23,41 @@ when to charge batteries, when to activate backup, when surplus can be absorbed.
 
 ## Architecture
 
+The deployed dashboard runs as a **standalone Streamlit app** — it loads the
+XGBoost model and calls Open-Meteo directly, with no FastAPI hop in between.
+A separate FastAPI service also exists (`src/api/main.py`) for programmatic
+access, but it is not part of the live deployment path.
+
 ```
-Weather APIs (Open-Meteo, NASA POWER)
+Open-Meteo (live weather)
          ↓
-  Data Ingestion Pipeline (Airflow DAGs)
+  Standalone Streamlit dashboard
+    ├── loads XGBoost model directly (src/models/xgboost_solar_v2.pkl)
+    └── runs a rule-based battery dispatch optimizer inline
          ↓
-  Feature Engineering (lag features, clear-sky ratio, cyclical encoding)
-         ↓
-  Forecasting Models (XGBoost + LSTM + Prophet ensemble)
-         ↓
-  Optimization Engine (storage dispatch, curtailment reduction)
-         ↓
-  FastAPI serving layer
-         ↓
-  Streamlit dashboard → grid operators
+  Grid operator view (KPIs, forecast chart, dispatch schedule, alerts)
 ```
+
+Model training (XGBoost, LSTM, Prophet, ensemble) happens in the notebooks
+under `notebooks/` — there is no `src/` pipeline yet to retrain models from
+code (see Known Gaps below).
 
 ---
 
 ## Project Structure
 
 ```
-solar_forecast_platform/
+.
 ├── configs/            # All configuration — nothing hardcoded in code
-├── data/
-│   ├── raw/            # Original API responses — never modified
-│   ├── processed/      # Cleaned, validated data
-│   └── features/       # Feature-engineered tables ready for modelling
 ├── src/
-│   ├── ingestion/      # API fetchers + data validators
-│   ├── features/       # Feature engineering pipeline
-│   ├── models/         # XGBoost, LSTM, Prophet, ensemble
-│   ├── optimization/   # Grid dispatch logic
-│   └── api/            # FastAPI endpoints
-├── airflow/dags/       # Orchestration — nightly retraining, daily ingestion
-├── dashboard/          # Streamlit operator dashboard
-├── tests/              # Unit + integration tests
-└── docs/               # Architecture decisions, API docs
+│   ├── ingestion/      # Open-Meteo fetcher + Jaipur data simulator
+│   ├── features/       # Placeholder — feature engineering currently lives in notebooks/
+│   ├── models/         # Serialized XGBoost model used by the dashboard/API
+│   ├── optimization/   # PuLP-based battery dispatch optimizer (not yet wired into the live dashboard)
+│   └── api/            # FastAPI service (standalone — not used by the deployed dashboard)
+├── dashboard/           # Standalone Streamlit app — this is what's deployed
+├── notebooks/          # EDA, feature engineering, model training (XGBoost/LSTM/Prophet/ensemble/optimization)
+└── tests/              # Unit tests
 ```
 
 ---
@@ -68,14 +66,14 @@ solar_forecast_platform/
 
 ```bash
 # Clone and set up
-git clone https://github.com/YOUR_USERNAME/solar-forecast-platform.git
-cd solar-forecast-platform
+git clone https://github.com/siddarth070/solar-forecasting-and-optimization-ai-platform.git
+cd solar-forecasting-and-optimization-ai-platform
 
 # Install dependencies
 pip install -r requirements.txt
 
-# Generate simulated Jaipur data
-python src/ingestion/jaipur_simulator.py
+# Run the dashboard locally
+streamlit run dashboard/app.py
 
 # Run tests
 pytest tests/ -v
@@ -83,17 +81,28 @@ pytest tests/ -v
 
 ---
 
-## Development Roadmap
+## Development Status
 
 | Phase | Focus | Status |
 |-------|-------|--------|
 | 0 | Environment setup + data ingestion | ✅ Complete |
-| 1 | EDA + data pipeline | 🔄 Next |
-| 2 | Feature engineering | ⏳ Planned |
-| 3 | Forecasting models + MLflow | ⏳ Planned |
-| 4 | Optimization engine | ⏳ Planned |
-| 5 | FastAPI + Streamlit dashboard | ⏳ Planned |
-| 6 | Docker + GCP deployment | ⏳ Planned |
+| 1 | EDA + data pipeline | ✅ Complete |
+| 2 | Feature engineering | ✅ Complete (in notebooks) |
+| 3 | Forecasting models (XGBoost, LSTM, Prophet) | ✅ Complete (in notebooks) |
+| 4 | Optimization engine | ✅ Complete (`src/optimization/`, not yet wired into the dashboard) |
+| 5 | FastAPI + Streamlit dashboard | ✅ Complete |
+| 6 | Docker + live deployment | ✅ Complete — [live demo](https://zenith-to.streamlit.app/) |
+
+### Known Gaps
+
+- `src/features/` has no code yet — feature engineering only exists in
+  `notebooks/feature_engineering.ipynb`.
+- The deployed dashboard uses a simple rule-based optimizer inline, not the
+  PuLP-based `src/optimization/battery_optimizer.py`.
+- `src/api/main.py` (FastAPI) isn't used by the live deployment; it's kept
+  for programmatic/API access.
+- Only the XGBoost model is wired into production; LSTM and Prophet exist as
+  trained artifacts under `notebooks/src/models/` but aren't served.
 
 ---
 
