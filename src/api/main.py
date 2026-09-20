@@ -12,7 +12,11 @@ from loguru import logger
 PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent
 sys.path.insert(0, str(PROJECT_ROOT))
 
+from src.features.pipeline import build_features, SERVING_FEATURE_COLUMNS
 from src.optimization.battery_optimizer import BatteryOptimizer
+from src.utils.config_loader import get_config
+
+CONFIG = get_config()
 
 # ── App setup ─────────────────────────────────────────────────
 app = FastAPI(
@@ -108,38 +112,33 @@ def forecast(request: ForecastRequest):
         )
 
     try:
-        # Build feature DataFrame from request
-        records = []
-        for h in request.hours:
-            hour_sin  = np.sin(2 * np.pi * h.hour / 24)
-            hour_cos  = np.cos(2 * np.pi * h.hour / 24)
-            month_sin = np.sin(2 * np.pi * h.month / 12)
-            month_cos = np.cos(2 * np.pi * h.month / 12)
-
-            records.append({
-                'cloud_cover': h.cloud_cover,
-                'shortwave_radiation': h.shortwave_radiation,
-                'temperature_2m': h.temperature_2m,
-                'relative_humidity_2m': h.relative_humidity_2m,
-                'wind_speed_10m': h.wind_speed_10m,
-                'hour sin': np.sin(2 * np.pi * h.hour / 24),
-                'hour cos': np.cos(2 * np.pi * h.hour / 24),
-                'month sin': np.sin(2 * np.pi * h.month / 12),
-                'month cos': np.cos(2 * np.pi * h.month / 12),
-                'solar_lag_1h': 0.0,
-                'solar_lag_24h': 0.0,
-                'solar_lag_48h': 0.0,
-                'solar_lag_168h': 0.0,
-                'solar_rolling_mean_3h': 0.0,
-                'solar_rolling_mean_6h': 0.0,
-                'solar_rolling_std_3h': 0.0,
-                'clear_sky_ratio': max(0, h.shortwave_radiation / 950),
-            }),
-
-
-        X = pd.DataFrame(records)
-        print("Columns being sent to model:", list(X.columns))
-        print("Model expects:", model.get_booster().feature_names)
+        # Build the feature DataFrame via the single canonical pipeline
+        # (src/features/pipeline.py) instead of a hand-built, easily
+        # drifting dict. build_features needs a real timestamp (to compute
+        # a solar-position clear-sky estimate); WeatherInput only carries
+        # hour + month, not a full date, so we anchor every request to a
+        # fixed reference year/day. This is an approximation pending P1.2
+        # (a proper per-plant, per-timestamp request schema) — it does not
+        # affect clear-sky GHI meaningfully within a given hour/month.
+        timestamps = pd.DatetimeIndex([
+            pd.Timestamp(year=2024, month=h.month, day=15, hour=h.hour,
+                         tz="Asia/Kolkata")
+            for h in request.hours
+        ])
+        raw = pd.DataFrame(
+            [{
+                "hour": h.hour,
+                "month": h.month,
+                "cloud_cover": h.cloud_cover,
+                "shortwave_radiation": h.shortwave_radiation,
+                "temperature_2m": h.temperature_2m,
+                "relative_humidity_2m": h.relative_humidity_2m,
+                "wind_speed_10m": h.wind_speed_10m,
+            } for h in request.hours],
+            index=timestamps,
+        )
+        features = build_features(raw, CONFIG)
+        X = features[SERVING_FEATURE_COLUMNS]
         predictions = model.predict(X)
         predictions = np.clip(
             predictions, 0, request.plant_capacity_mw

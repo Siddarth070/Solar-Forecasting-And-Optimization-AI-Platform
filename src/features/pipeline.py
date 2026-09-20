@@ -26,9 +26,9 @@ import numpy as np
 import pandas as pd
 import pvlib
 
-# Columns the trained model expects, in order. Any change here is a
-# breaking change to the served model and must ship with a retrained
-# artifact (see P0.3 — feature/serving parity).
+# Every feature build_features() can produce, given enough history. Used
+# for offline analysis (e.g. the leakage tests) where solar_output_mw's
+# past values are actually available.
 FEATURE_COLUMNS = [
     "cloud_cover",
     "shortwave_radiation",
@@ -46,6 +46,28 @@ FEATURE_COLUMNS = [
     "solar_rolling_mean_3h",
     "solar_rolling_mean_6h",
     "solar_rolling_std_3h",
+    "clear_sky_index",
+]
+
+# The subset the SERVED model actually trains and predicts on. A live
+# dashboard/API request is a one-shot weather forecast with no access to
+# the plant's actual past generation (there is no per-plant history store
+# yet — that's P1.1+), so solar_lag_*/solar_rolling_* can never be
+# honestly computed at serving time. Per roadmap checklist item 9, an
+# unservable feature is "computed from real history, or removed" — we
+# remove it here rather than hardcode a fake value (that was audit
+# finding F2). Once real per-plant history exists, this can grow back to
+# match FEATURE_COLUMNS.
+SERVING_FEATURE_COLUMNS = [
+    "cloud_cover",
+    "shortwave_radiation",
+    "temperature_2m",
+    "relative_humidity_2m",
+    "wind_speed_10m",
+    "hour_sin",
+    "hour_cos",
+    "month_sin",
+    "month_cos",
     "clear_sky_index",
 ]
 

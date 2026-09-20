@@ -20,6 +20,12 @@ from datetime import datetime
 # ── Path setup ────────────────────────────────────────────────
 PROJECT_ROOT = Path(__file__).resolve().parent
 sys.path.insert(0, str(PROJECT_ROOT))
+sys.path.insert(0, str(PROJECT_ROOT.parent))
+
+from src.features.pipeline import build_features, SERVING_FEATURE_COLUMNS
+from src.utils.config_loader import get_config
+
+CONFIG = get_config()
 
 # ── Page config ───────────────────────────────────────────────
 st.set_page_config(
@@ -112,35 +118,25 @@ def get_live_weather():
 
 # ── Forecast function ─────────────────────────────────────────
 def run_forecast(weather_data):
-    """Run XGBoost model on weather data."""
+    """Run XGBoost model on weather data via the canonical feature pipeline
+    (src/features/pipeline.py) — no more hand-built, drifting feature dict."""
     if model is None:
         return None
 
-    records = []
-    for h in weather_data:
-        hour  = h['hour']
-        month = h['month']
-        records.append({
-            'cloud_cover'          : h['cloud_cover'],
-            'shortwave_radiation'  : h['shortwave_radiation'],
-            'temperature_2m'       : h['temperature_2m'],
-            'relative_humidity_2m' : h['relative_humidity_2m'],
-            'wind_speed_10m'       : h['wind_speed_10m'],
-            'hour sin'             : np.sin(2 * np.pi * hour / 24),
-            'hour cos'             : np.cos(2 * np.pi * hour / 24),
-            'month sin'            : np.sin(2 * np.pi * month / 12),
-            'month cos'            : np.cos(2 * np.pi * month / 12),
-            'solar_lag_1h'         : 0.0,
-            'solar_lag_24h'        : 0.0,
-            'solar_lag_48h'        : 0.0,
-            'solar_lag_168h'       : 0.0,
-            'solar_rolling_mean_3h': 0.0,
-            'solar_rolling_mean_6h': 0.0,
-            'solar_rolling_std_3h' : 0.0,
-            'clear_sky_ratio'      : max(0, h['shortwave_radiation'] / 950),
-        })
+    # build_features needs a real timestamp (for the solar-position
+    # clear-sky estimate); weather_data only carries hour + month, so we
+    # anchor to a fixed reference year/day, same approach as the API
+    # (src/api/main.py) — an approximation pending a proper per-timestamp
+    # request shape (P1.2).
+    timestamps = pd.DatetimeIndex([
+        pd.Timestamp(year=2024, month=h["month"], day=15, hour=h["hour"],
+                     tz="Asia/Kolkata")
+        for h in weather_data
+    ])
+    raw = pd.DataFrame(weather_data, index=timestamps)
+    features = build_features(raw, CONFIG)
+    X = features[SERVING_FEATURE_COLUMNS]
 
-    X = pd.DataFrame(records)
     predictions = model.predict(X)
     return np.clip(predictions, 0, 100).tolist()
 
