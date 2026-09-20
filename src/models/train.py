@@ -26,6 +26,16 @@ WHAT IT TRAINS ON:
   actual past generation, so a model trained to expect solar_lag_1h etc.
   could never be honestly served (see src/features/pipeline.py).
 
+  The WEATHER INPUTS are forecast-quality, not perfect (see
+  src/ingestion/synthetic_forecast.py) — a live request only ever supplies
+  a forecast, never the true value, so training on the simulator's perfect
+  weather would teach the model a distribution it will never actually see
+  in production. (benchmark.py's P0.5 "deliverable skill" scoring caught
+  exactly this mismatch: a model trained on true weather looked excellent
+  fed true weather and collapsed below a trivial baseline fed realistic
+  forecast weather.) The TARGET is untouched — solar_output_mw is what
+  really generated; only the weather the model gets to see is degraded.
+
 RUN WITH:
   python -m src.models.train
 """
@@ -43,17 +53,20 @@ sys.path.insert(0, str(PROJECT_ROOT))
 
 from src.features.pipeline import build_features, SERVING_FEATURE_COLUMNS
 from src.ingestion.jaipur_simulator import generate_jaipur_weather
+from src.ingestion.synthetic_forecast import simulate_day_ahead_forecast
 from src.utils.config_loader import get_config
 
 MODEL_PATH = PROJECT_ROOT / "src" / "models" / "xgboost_solar_v2.pkl"
 TARGET_COLUMN = "solar_output_mw"
+TRAINING_FORECAST_NOISE_SEED = 7  # distinct from benchmark.py's holdout seeds (99, 100)
 
 
 def train():
     config = get_config()
 
-    raw = generate_jaipur_weather(start_date="2024-01-01", days=365)
-    featured = build_features(raw, config).dropna(
+    true_weather = generate_jaipur_weather(start_date="2024-01-01", days=365)
+    forecast_quality = simulate_day_ahead_forecast(true_weather, seed=TRAINING_FORECAST_NOISE_SEED)
+    featured = build_features(forecast_quality, config).dropna(
         subset=[*SERVING_FEATURE_COLUMNS, TARGET_COLUMN]
     )
 

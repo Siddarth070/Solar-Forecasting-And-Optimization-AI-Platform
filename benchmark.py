@@ -53,12 +53,14 @@ sys.path.insert(0, str(PROJECT_ROOT))
 
 from src.features.pipeline import build_features, SERVING_FEATURE_COLUMNS
 from src.ingestion.jaipur_simulator import generate_jaipur_weather
+from src.ingestion.synthetic_forecast import simulate_day_ahead_forecast
 from src.utils.config_loader import get_config
 
 MODEL_PATH = PROJECT_ROOT / "src" / "models" / "xgboost_solar_v2.pkl"
 
 # Must match src/models/train.py exactly -- this IS the development period.
 DEV_START, DEV_DAYS, DEV_SEED = "2024-01-01", 365, 42
+DEV_FORECAST_NOISE_SEED = 7  # matches src/models/train.py's TRAINING_FORECAST_NOISE_SEED
 
 # A period + seed neither train.py nor any test has ever generated. Must
 # fall entirely outside [DEV_START, DEV_START + DEV_DAYS) -- a different
@@ -173,40 +175,64 @@ def rolling_origin_backtest(features: pd.DataFrame, config: dict) -> pd.DataFram
 def final_holdout_eval(served_model, config: dict) -> dict:
     """The one number that counts: the model actually being served, scored
     ONCE on a period it has never seen -- different date range, different
-    random seed than train.py or any test file uses."""
+    random seed than train.py or any test file uses.
+
+    Scored TWICE, per roadmap P0.5, because "the model" and "the product"
+    have different error sources:
+      - MODEL SKILL: fed the true weather the simulator generated, as if
+        the weather forecast were perfect. Isolates how good the model
+        itself is.
+      - DELIVERABLE SKILL: fed a simulated D-1 09:00 forecast with realistic
+        forecast error baked in (see _synthetic_day_ahead_forecast). This is
+        what a real customer actually receives -- the gap between the two
+        numbers IS the weather-forecast error, and reporting only the first
+        one would be misleading.
+    """
     raw = generate_jaipur_weather(start_date=HOLDOUT_START, days=HOLDOUT_DAYS, seed=HOLDOUT_SEED)
-    features = build_features(raw, config)
-    y = features["solar_output_mw"]
     capacity_mw = config["solar_plant"]["capacity_mw"]
-    daytime = features["clear_sky_ghi_model"] > 1.0
 
-    model_preds = pd.Series(
-        np.clip(served_model.predict(features[SERVING_FEATURE_COLUMNS]), 0, capacity_mw),
-        index=features.index,
-    )
+    observed_features = build_features(raw, config)
+    forecast_features = build_features(simulate_day_ahead_forecast(raw, seed=HOLDOUT_SEED + 1), config)
+    # y and the daylight mask come from the true data in both cases -- only
+    # the WEATHER INPUT fed to the model differs between the two scorings.
+    y = observed_features["solar_output_mw"]
+    daytime = observed_features["clear_sky_ghi_model"] > 1.0
+
     persistence = _persistence_baseline(y)
-    smart_persistence = _smart_persistence_baseline(y, features, config)
-    physics = _physics_baseline(features, config)
+    smart_persistence = _smart_persistence_baseline(y, observed_features, config)
+    physics = _physics_baseline(observed_features, config)
 
-    print(f"\nFINAL HOLDOUT -- {HOLDOUT_START} + {HOLDOUT_DAYS}d, seed={HOLDOUT_SEED}")
-    print("(never used by src/models/train.py or any test -- scored once)\n")
     scores = {}
-    for name, preds in [
-        ("model", model_preds), ("persistence", persistence),
-        ("smart_persistence", smart_persistence), ("physics", physics),
-    ]:
-        nmae, nrmse, n = _nmae_nrmse(y, preds, capacity_mw, daytime)
-        scores[name] = nmae
-        print(f"  {name:18s}  nMAE {nmae:6.2f}%   nRMSE {nrmse:6.2f}%   (n={n})")
+    for label, features in [("MODEL SKILL (observed weather)", observed_features),
+                             ("DELIVERABLE SKILL (D-1 09:00 forecast weather, synthetic)", forecast_features)]:
+        model_preds = pd.Series(
+            np.clip(served_model.predict(features[SERVING_FEATURE_COLUMNS]), 0, capacity_mw),
+            index=features.index,
+        )
+        print(f"\nFINAL HOLDOUT -- {label}")
+        print(f"({HOLDOUT_START} + {HOLDOUT_DAYS}d, seed={HOLDOUT_SEED} -- never used by "
+              f"src/models/train.py or any test, scored once)\n")
+        for name, preds in [
+            ("model", model_preds), ("persistence", persistence),
+            ("smart_persistence", smart_persistence), ("physics", physics),
+        ]:
+            nmae, nrmse, n = _nmae_nrmse(y, preds, capacity_mw, daytime)
+            scores.setdefault(name, {})[label] = nmae
+            print(f"  {name:18s}  nMAE {nmae:6.2f}%   nRMSE {nrmse:6.2f}%   (n={n})")
 
-    print()
-    if scores["model"] < scores["smart_persistence"]:
-        print(f"PASS -- model ({scores['model']:.2f}% nMAE) beats smart_persistence "
-              f"({scores['smart_persistence']:.2f}% nMAE).")
+    model_skill = scores["model"]["MODEL SKILL (observed weather)"]
+    deliverable_skill = scores["model"]["DELIVERABLE SKILL (D-1 09:00 forecast weather, synthetic)"]
+    smart_skill = scores["smart_persistence"]["DELIVERABLE SKILL (D-1 09:00 forecast weather, synthetic)"]
+    print(f"\nWeather-forecast error cost: {deliverable_skill - model_skill:+.2f} points of nMAE "
+          f"(model skill {model_skill:.2f}% -> deliverable skill {deliverable_skill:.2f}%).")
+
+    if deliverable_skill < smart_skill:
+        print(f"PASS -- deliverable skill ({deliverable_skill:.2f}% nMAE) beats smart_persistence "
+              f"({smart_skill:.2f}% nMAE) under realistic forecast-weather conditions.")
     else:
-        print(f"FAIL -- model ({scores['model']:.2f}% nMAE) does NOT beat smart_persistence "
-              f"({scores['smart_persistence']:.2f}% nMAE). Per roadmap P0.4: stop and diagnose "
-              f"before building anything else on top of this model.")
+        print(f"FAIL -- deliverable skill ({deliverable_skill:.2f}% nMAE) does NOT beat "
+              f"smart_persistence ({smart_skill:.2f}% nMAE) once forecast-weather error is "
+              f"accounted for. Per roadmap P0.4: stop and diagnose before building anything else.")
     return scores
 
 
@@ -219,7 +245,12 @@ def main():
         served_model = pickle.load(f)
 
     dev_raw = generate_jaipur_weather(start_date=DEV_START, days=DEV_DAYS, seed=DEV_SEED)
-    dev_features = build_features(dev_raw, config)
+    # Forecast-quality inputs, matching src/models/train.py -- the served
+    # model is trained this way now (P0.5), so the backtest's own internal
+    # retrains at each origin should reflect the same real-world condition,
+    # not the simulator's perfect weather.
+    dev_forecast_quality = simulate_day_ahead_forecast(dev_raw, seed=DEV_FORECAST_NOISE_SEED)
+    dev_features = build_features(dev_forecast_quality, config)
 
     rolling_origin_backtest(dev_features, config)
     final_holdout_eval(served_model, config)
