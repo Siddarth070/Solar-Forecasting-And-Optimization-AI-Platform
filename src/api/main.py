@@ -1,12 +1,12 @@
 import numpy as np
 import pandas as pd
-import pickle
 import sys
 from pathlib import Path
 from datetime import datetime
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel, Field
 from loguru import logger
+from xgboost import XGBRegressor
 
 # Add project root to path
 PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent
@@ -26,13 +26,15 @@ app = FastAPI(
 )
 
 # ── Load model on startup ─────────────────────────────────────
-MODEL_PATH = PROJECT_ROOT / "src" / "models" / "xgboost_solar_v2.pkl"
+# JSON, not pickle: a pickle can silently break across library versions
+# and is opaque to review (roadmap P0.6).
+MODEL_PATH = PROJECT_ROOT / "src" / "models" / "xgboost_solar_v2.json"
 
-try:
-    with open(MODEL_PATH, "rb") as f:
-        model = pickle.load(f)
+if MODEL_PATH.exists():
+    model = XGBRegressor()
+    model.load_model(str(MODEL_PATH))
     logger.success(f"Model loaded from {MODEL_PATH}")
-except FileNotFoundError:
+else:
     logger.error(f"Model not found at {MODEL_PATH}")
     model = None
 

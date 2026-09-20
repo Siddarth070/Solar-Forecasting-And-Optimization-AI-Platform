@@ -6,18 +6,9 @@ WHY THIS EXISTS:
   xgboost_solar_v2.pkl used to be produced by no code in this repo — the
   only training notebook built a different, 25-feature version, and the
   notebook itself had hardcoded local paths (audit finding F3). This
-  script is the first reproducible path from data to served artifact.
-
-  It is a MINIMAL trainer, not the full reproducibility story: no
-  `make train` target, no model_card.json, no JSON serialization, no
-  git-SHA tracking, no proper rolling-origin evaluation with baselines.
-  Those are roadmap task P0.6 (reproducibility) and P0.4 (honest
-  evaluation harness) — deliberately not done here. This script exists
-  so that P0.2 (single feature pipeline, no hand-duplicated feature
-  dicts in the API/dashboard) has a real model to serve that actually
-  matches src.features.pipeline's feature names and values, instead of
-  the previous model, which was trained on a leaky clear_sky_ratio
-  feature under different column names entirely.
+  script is the reproducible path from data to served artifact: `make
+  train` (see the repo-root Makefile) runs it end to end on a clean
+  clone, with no manual steps.
 
 WHAT IT TRAINS ON:
   Only SERVING_FEATURE_COLUMNS — weather + time-of-day + clear_sky_index.
@@ -36,11 +27,26 @@ WHAT IT TRAINS ON:
   forecast weather.) The TARGET is untouched — solar_output_mw is what
   really generated; only the weather the model gets to see is degraded.
 
+  The training data itself is not stored anywhere (data/ is gitignored
+  and empty) — it doesn't need to be: generate_jaipur_weather() plus
+  simulate_day_ahead_forecast() are deterministic given the seeds
+  recorded below and in model_card.json, so anyone can rebuild the exact
+  training set from this script alone.
+
+REPRODUCIBILITY:
+  The model is saved as JSON (XGBoost's native format, human-diffable),
+  not pickle — a pickle can silently break across library versions and
+  is opaque to review. src/models/model_card.json is written alongside
+  it with the git commit, data window, feature list, and this script's
+  own quick sanity-check metrics. benchmark.py (P0.4/P0.5) later adds
+  the real evaluation — rolling-origin backtest, baselines, and the
+  model-skill/deliverable-skill split — to the SAME file.
+
 RUN WITH:
-  python -m src.models.train
+  make train
+  (or directly: python -m src.models.train)
 """
 
-import pickle
 import sys
 from pathlib import Path
 
@@ -54,26 +60,32 @@ sys.path.insert(0, str(PROJECT_ROOT))
 from src.features.pipeline import build_features, SERVING_FEATURE_COLUMNS
 from src.ingestion.jaipur_simulator import generate_jaipur_weather
 from src.ingestion.synthetic_forecast import simulate_day_ahead_forecast
+from src.models.model_card import update_model_card
 from src.utils.config_loader import get_config
 
-MODEL_PATH = PROJECT_ROOT / "src" / "models" / "xgboost_solar_v2.pkl"
+MODEL_PATH = PROJECT_ROOT / "src" / "models" / "xgboost_solar_v2.json"
 TARGET_COLUMN = "solar_output_mw"
+
+TRAINING_START = "2024-01-01"
+TRAINING_DAYS = 365
+TRAINING_WEATHER_SEED = 42  # generate_jaipur_weather's own default
 TRAINING_FORECAST_NOISE_SEED = 7  # distinct from benchmark.py's holdout seeds (99, 100)
 
 
 def train():
     config = get_config()
 
-    true_weather = generate_jaipur_weather(start_date="2024-01-01", days=365)
+    true_weather = generate_jaipur_weather(
+        start_date=TRAINING_START, days=TRAINING_DAYS, seed=TRAINING_WEATHER_SEED
+    )
     forecast_quality = simulate_day_ahead_forecast(true_weather, seed=TRAINING_FORECAST_NOISE_SEED)
     featured = build_features(forecast_quality, config).dropna(
         subset=[*SERVING_FEATURE_COLUMNS, TARGET_COLUMN]
     )
 
-    # Simple chronological split — a placeholder honesty check only.
-    # The real evaluation (rolling-origin backtest, persistence and
-    # smart-persistence baselines, nMAE/nRMSE as % of AC capacity) is
-    # roadmap task P0.4, deliberately not built here.
+    # Simple chronological split — a placeholder honesty check only. The
+    # real evaluation (rolling-origin backtest, baselines, nMAE/nRMSE,
+    # model-skill/deliverable-skill split) lives in benchmark.py.
     split = int(len(featured) * 0.8)
     train_df, test_df = featured.iloc[:split], featured.iloc[split:]
 
@@ -94,11 +106,13 @@ def train():
     mae = mean_absolute_error(y_test, predictions)
     rmse = np.sqrt(mean_squared_error(y_test, predictions))
     capacity_mw = config["solar_plant"]["capacity_mw"]
+    nmae_pct = 100 * mae / capacity_mw
+    nrmse_pct = 100 * rmse / capacity_mw
 
     print(f"Trained on {len(X_train)} rows, held out {len(X_test)} rows (last 20%, chronological).")
-    print(f"[PROVISIONAL — see P0.4 for the real evaluation harness]")
-    print(f"  MAE:  {mae:.2f} MW  ({100 * mae / capacity_mw:.2f}% of {capacity_mw:.0f} MW capacity)")
-    print(f"  RMSE: {rmse:.2f} MW ({100 * rmse / capacity_mw:.2f}% of {capacity_mw:.0f} MW capacity)")
+    print("[PROVISIONAL split -- see benchmark.py / model_card.json for the real evaluation]")
+    print(f"  nMAE:  {nmae_pct:.2f}% of {capacity_mw:.0f} MW capacity")
+    print(f"  nRMSE: {nrmse_pct:.2f}% of {capacity_mw:.0f} MW capacity")
 
     importances = sorted(
         zip(SERVING_FEATURE_COLUMNS, model.feature_importances_),
@@ -108,9 +122,35 @@ def train():
     for name, score in importances:
         print(f"  {name:25s} {score:.4f}")
 
-    with open(MODEL_PATH, "wb") as f:
-        pickle.dump(model, f)
+    model.save_model(str(MODEL_PATH))
     print(f"Saved model to {MODEL_PATH}")
+
+    card = update_model_card(
+        model_path=MODEL_PATH.name,
+        data_window={
+            "start": TRAINING_START,
+            "days": TRAINING_DAYS,
+            "weather_seed": TRAINING_WEATHER_SEED,
+            "forecast_noise_seed": TRAINING_FORECAST_NOISE_SEED,
+            "source": "src.ingestion.jaipur_simulator.generate_jaipur_weather "
+                      "+ src.ingestion.synthetic_forecast.simulate_day_ahead_forecast "
+                      "(synthetic, deterministic given these seeds -- not stored, regenerable "
+                      "by re-running `make train`)",
+        },
+        feature_list=SERVING_FEATURE_COLUMNS,
+        train_test_split_metrics={
+            "split": "80/20 chronological, provisional only",
+            "n_train": len(X_train),
+            "n_test": len(X_test),
+            "nmae_pct": round(nmae_pct, 3),
+            "nrmse_pct": round(nrmse_pct, 3),
+            "note": "not the real evaluation -- see benchmark.py's rolling-origin backtest "
+                    "and final holdout in this same file, under rolling_origin_backtest / "
+                    "final_holdout",
+        },
+    )
+    print(f"Updated {config['project']['name']} model card at src/models/model_card.json "
+          f"(git_sha={card['git_sha'][:12]})")
 
 
 if __name__ == "__main__":

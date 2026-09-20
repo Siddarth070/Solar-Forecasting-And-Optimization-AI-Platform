@@ -13,12 +13,12 @@ RUN WITH:
   pytest tests/test_feature_parity.py -v
 """
 
-import pickle
 import sys
 from pathlib import Path
 
 import pandas as pd
 import pytest
+from xgboost import XGBRegressor
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(PROJECT_ROOT))
@@ -26,14 +26,15 @@ sys.path.insert(0, str(PROJECT_ROOT))
 from src.features.pipeline import build_features, SERVING_FEATURE_COLUMNS
 from src.utils.config_loader import get_config
 
-MODEL_PATH = PROJECT_ROOT / "src" / "models" / "xgboost_solar_v2.pkl"
+MODEL_PATH = PROJECT_ROOT / "src" / "models" / "xgboost_solar_v2.json"
 
 
 def _served_model():
     if not MODEL_PATH.exists():
         pytest.skip(f"served model not found at {MODEL_PATH}")
-    with open(MODEL_PATH, "rb") as f:
-        return pickle.load(f)
+    model = XGBRegressor()
+    model.load_model(str(MODEL_PATH))
+    return model
 
 
 def _representative_request_frame() -> pd.DataFrame:

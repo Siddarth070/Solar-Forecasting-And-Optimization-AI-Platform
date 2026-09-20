@@ -40,7 +40,6 @@ RUN WITH:
   python benchmark.py
 """
 
-import pickle
 import sys
 from pathlib import Path
 
@@ -54,9 +53,10 @@ sys.path.insert(0, str(PROJECT_ROOT))
 from src.features.pipeline import build_features, SERVING_FEATURE_COLUMNS
 from src.ingestion.jaipur_simulator import generate_jaipur_weather
 from src.ingestion.synthetic_forecast import simulate_day_ahead_forecast
+from src.models.model_card import update_model_card
 from src.utils.config_loader import get_config
 
-MODEL_PATH = PROJECT_ROOT / "src" / "models" / "xgboost_solar_v2.pkl"
+MODEL_PATH = PROJECT_ROOT / "src" / "models" / "xgboost_solar_v2.json"
 
 # Must match src/models/train.py exactly -- this IS the development period.
 DEV_START, DEV_DAYS, DEV_SEED = "2024-01-01", 365, 42
@@ -240,9 +240,9 @@ def main():
     config = get_config()
 
     if not MODEL_PATH.exists():
-        raise SystemExit(f"No served model at {MODEL_PATH} -- run `python -m src.models.train` first.")
-    with open(MODEL_PATH, "rb") as f:
-        served_model = pickle.load(f)
+        raise SystemExit(f"No served model at {MODEL_PATH} -- run `make train` first.")
+    served_model = XGBRegressor()
+    served_model.load_model(str(MODEL_PATH))
 
     dev_raw = generate_jaipur_weather(start_date=DEV_START, days=DEV_DAYS, seed=DEV_SEED)
     # Forecast-quality inputs, matching src/models/train.py -- the served
@@ -252,8 +252,34 @@ def main():
     dev_forecast_quality = simulate_day_ahead_forecast(dev_raw, seed=DEV_FORECAST_NOISE_SEED)
     dev_features = build_features(dev_forecast_quality, config)
 
-    rolling_origin_backtest(dev_features, config)
-    final_holdout_eval(served_model, config)
+    rolling_results = rolling_origin_backtest(dev_features, config)
+    holdout_scores = final_holdout_eval(served_model, config)
+
+    observed_label = "MODEL SKILL (observed weather)"
+    forecast_label = "DELIVERABLE SKILL (D-1 09:00 forecast weather, synthetic)"
+    update_model_card(
+        rolling_origin_backtest={
+            "n_origins": len(rolling_results),
+            "horizon_hours": FORECAST_HORIZON_HOURS,
+            "development_period": {"start": DEV_START, "days": DEV_DAYS},
+            "averaged_nmae_pct": {
+                name: round(float(rolling_results[f"{name}_nmae"].mean()), 3) for name in BASELINE_NAMES
+            },
+            "averaged_nrmse_pct": {
+                name: round(float(rolling_results[f"{name}_nrmse"].mean()), 3) for name in BASELINE_NAMES
+            },
+        },
+        final_holdout={
+            "period": {"start": HOLDOUT_START, "days": HOLDOUT_DAYS, "seed": HOLDOUT_SEED},
+            "model_skill_nmae_pct": {
+                name: round(float(scores[observed_label]), 3) for name, scores in holdout_scores.items()
+            },
+            "deliverable_skill_nmae_pct": {
+                name: round(float(scores[forecast_label]), 3) for name, scores in holdout_scores.items()
+            },
+        },
+    )
+    print("\nUpdated src/models/model_card.json with the benchmark results above.")
 
 
 if __name__ == "__main__":

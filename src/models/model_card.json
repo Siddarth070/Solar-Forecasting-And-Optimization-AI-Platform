@@ -1,0 +1,70 @@
+{
+  "model_path": "xgboost_solar_v2.json",
+  "data_window": {
+    "start": "2024-01-01",
+    "days": 365,
+    "weather_seed": 42,
+    "forecast_noise_seed": 7,
+    "source": "src.ingestion.jaipur_simulator.generate_jaipur_weather + src.ingestion.synthetic_forecast.simulate_day_ahead_forecast (synthetic, deterministic given these seeds -- not stored, regenerable by re-running `make train`)"
+  },
+  "feature_list": [
+    "cloud_cover",
+    "shortwave_radiation",
+    "temperature_2m",
+    "relative_humidity_2m",
+    "wind_speed_10m",
+    "hour_sin",
+    "hour_cos",
+    "month_sin",
+    "month_cos",
+    "clear_sky_index"
+  ],
+  "train_test_split_metrics": {
+    "split": "80/20 chronological, provisional only",
+    "n_train": 7008,
+    "n_test": 1752,
+    "nmae_pct": 0.972,
+    "nrmse_pct": 1.799,
+    "note": "not the real evaluation -- see benchmark.py's rolling-origin backtest and final holdout in this same file, under rolling_origin_backtest / final_holdout"
+  },
+  "git_sha": "211534a4da055f48f944714486e0bb416b096599",
+  "rolling_origin_backtest": {
+    "n_origins": 48,
+    "horizon_hours": 24,
+    "development_period": {
+      "start": "2024-01-01",
+      "days": 365
+    },
+    "averaged_nmae_pct": {
+      "model": 1.341,
+      "persistence": 2.104,
+      "smart_persistence": 2.12,
+      "physics": 5.582
+    },
+    "averaged_nrmse_pct": {
+      "model": 1.803,
+      "persistence": 2.907,
+      "smart_persistence": 2.924,
+      "physics": 7.592
+    }
+  },
+  "final_holdout": {
+    "period": {
+      "start": "2025-06-01",
+      "days": 30,
+      "seed": 99
+    },
+    "model_skill_nmae_pct": {
+      "model": 0.558,
+      "persistence": 0.815,
+      "smart_persistence": 0.814,
+      "physics": 3.294
+    },
+    "deliverable_skill_nmae_pct": {
+      "model": 0.639,
+      "persistence": 0.815,
+      "smart_persistence": 0.814,
+      "physics": 3.294
+    }
+  }
+}

@@ -12,10 +12,10 @@ import pandas as pd
 import numpy as np
 import plotly.graph_objects as go
 import requests
-import pickle
 import sys
 from pathlib import Path
 from datetime import datetime
+from xgboost import XGBRegressor
 
 # ── Path setup ────────────────────────────────────────────────
 PROJECT_ROOT = Path(__file__).resolve().parent
@@ -37,19 +37,22 @@ st.set_page_config(
 # ── Load model ────────────────────────────────────────────────
 @st.cache_resource
 def load_model():
-    """Load XGBoost model — tries multiple paths for local and Docker."""
+    """Load XGBoost model — tries multiple paths for local and Docker.
+    JSON, not pickle: a pickle can silently break across library versions
+    and is opaque to review (roadmap P0.6)."""
     possible_paths = [
-        Path(__file__).resolve().parent / "src" / "models" / "xgboost_solar_v2.pkl",
-        Path("/app/src/models/xgboost_solar_v2.pkl"),
-        Path("src/models/xgboost_solar_v2.pkl"),
-        Path(__file__).resolve().parent.parent / "src" / "models" / "xgboost_solar_v2.pkl",
+        Path(__file__).resolve().parent / "src" / "models" / "xgboost_solar_v2.json",
+        Path("/app/src/models/xgboost_solar_v2.json"),
+        Path("src/models/xgboost_solar_v2.json"),
+        Path(__file__).resolve().parent.parent / "src" / "models" / "xgboost_solar_v2.json",
     ]
 
     for path in possible_paths:
         if path.exists():
             try:
-                with open(path, "rb") as f:
-                    return pickle.load(f), True
+                model = XGBRegressor()
+                model.load_model(str(path))
+                return model, True
             except Exception:
                 continue
 
@@ -197,7 +200,7 @@ st.caption("Peak solar intelligence for India's grid — Jaipur, Rajasthan")
 if model_loaded:
     st.success("✅ Model loaded | XGBoost solar forecasting active")
 else:
-    st.error("❌ Model not found — check src/models/xgboost_solar_v2.pkl")
+    st.error("❌ Model not found — check src/models/xgboost_solar_v2.json")
     st.stop()
 
 # Fetch weather
