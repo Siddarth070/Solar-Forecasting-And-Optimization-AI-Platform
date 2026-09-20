@@ -52,7 +52,7 @@ TARGET_COLUMN = "solar_output_mw"
 def train():
     config = get_config()
 
-    raw = generate_jaipur_weather(start_date="2024-01-01", days=90)
+    raw = generate_jaipur_weather(start_date="2024-01-01", days=365)
     featured = build_features(raw, config).dropna(
         subset=[*SERVING_FEATURE_COLUMNS, TARGET_COLUMN]
     )
