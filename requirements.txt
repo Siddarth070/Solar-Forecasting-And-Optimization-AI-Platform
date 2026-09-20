@@ -26,6 +26,9 @@ xgboost>=1.7.0
 # tensorflow>=2.13.0     # Needed only to retrain/run the LSTM model (notebooks/)
 # prophet>=1.1.4         # Needed only to retrain/run the Prophet model (notebooks/)
 
+# ── Feature engineering ──────────────────────────────────────
+pvlib>=0.10.0            # Solar-position clear-sky model (src/features/pipeline.py)
+
 # ── Experiment tracking ──────────────────────────────────────
 # mlflow>=2.7.0          # Not currently wired up — enable if you add tracking
 
