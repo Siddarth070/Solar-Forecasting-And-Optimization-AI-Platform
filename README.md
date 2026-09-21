@@ -92,7 +92,9 @@ a single `docker run` gets the standalone dashboard only.
 
 ```
 .
-├── configs/            # All configuration — nothing hardcoded in code
+├── configs/
+│   ├── config.yaml     # Global, plant-agnostic settings only
+│   └── plants/         # One YAML per plant (location, capacity) — see src/utils/config_loader.get_plant_config
 ├── src/
 │   ├── ingestion/      # Open-Meteo fetcher, Jaipur data simulator, synthetic forecast-error model
 │   ├── features/       # pipeline.py — the one feature implementation (training, API, dashboard all import it)
@@ -100,7 +102,7 @@ a single `docker run` gets the standalone dashboard only.
 │   ├── optimization/   # PuLP-based battery dispatch optimizer (not yet wired into the live dashboard)
 │   └── api/            # FastAPI service (standalone — not used by the deployed dashboard)
 ├── dashboard/          # Standalone Streamlit app — this is what's deployed
-├── notebooks/          # Archived exploration: EDA, LSTM/Prophet/ensemble experiments (not served — see Known Gaps)
+├── notebooks/          # Archived exploration — see notebooks/README.md (not served, roadmap P1.8)
 ├── benchmark.py         # Honest evaluation: rolling-origin backtest + baselines
 ├── Makefile             # make train / make benchmark / make test
 └── tests/               # Unit tests, run in CI on every push (.github/workflows/)
@@ -144,20 +146,31 @@ on a Phase 0 credibility checklist (target leakage, train/serve parity,
 honest evaluation, reproducibility, dependency hygiene, this README) before
 any new feature work. As of this commit:
 
-- **Done:** target leakage removed and tested in CI; one shared feature
-  pipeline (no more hand-duplicated feature dicts in the API/dashboard);
-  a feature/serving parity test; the honest evaluation harness above;
-  model-skill vs. deliverable-skill split; reproducible training
-  (`make train`, JSON model format, `model_card.json`); Docker build
-  fixed (non-root, both services start, verified in CI); dependencies
-  fully pinned.
-- **Not started:** per-plant/multi-state configuration, a proper 15-minute
-  time-block engine, probabilistic (P10/P50/P90) forecasts, real
-  customer-file ingestion, loss attribution, and any real-plant
-  validation. All of Phases 1 onward.
+- **Phase 0, done:** target leakage removed and tested in CI; one shared
+  feature pipeline (no more hand-duplicated feature dicts in the
+  API/dashboard); a feature/serving parity test; the honest evaluation
+  harness above; model-skill vs. deliverable-skill split; reproducible
+  training (`make train`, JSON model format, `model_card.json`); Docker
+  build fixed (non-root, both services start, verified in CI);
+  dependencies fully pinned.
+- **Phase 1, partially done:** per-plant configuration (`configs/plants/`
+  — two plants in two states run from the same binary, tested in CI; the
+  model trains on capacity FRACTION so one artifact correctly serves
+  differently-sized plants); the dashboard's fake sine-wave "demand"
+  curve replaced with an operator-set declared schedule. **Not done:**
+  the 15-minute time-block engine, probabilistic (P10/P50/P90) forecasts,
+  the battery optimizer rewrite, and config-driven DSM rulesets (the
+  last needs verified CERC/SERC regulatory data, not fabricated numbers).
+- **Not started:** real customer-file ingestion, loss attribution, and
+  any real-plant validation — Phase 2 onward.
 
 ## Known Gaps
 
+- The weather SIMULATOR (`src/ingestion/jaipur_simulator.py`) is still
+  Jaipur-specific — `configs/plants/pune_50mw.yaml` proves the
+  config/serving layer is plant-agnostic, not that a real Pune-trained
+  model exists. That needs a location-aware simulator or real per-plant
+  data (Phase 3).
 - The deployed dashboard's battery optimizer is a simple rule-based
   heuristic, not the PuLP linear program in `src/optimization/` — and
   that LP itself currently has no round-trip efficiency and only supports
