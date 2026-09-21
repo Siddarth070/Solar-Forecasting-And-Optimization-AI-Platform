@@ -1,0 +1,46 @@
+name: Docker
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  build-and-smoke-test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build image
+        run: docker build -t zenith-test .
+
+      - name: Confirm the container runs as a non-root user
+        run: |
+          user=$(docker run --rm zenith-test whoami)
+          echo "container user: $user"
+          test "$user" = "appuser"
+
+      - name: Bring up API + dashboard via docker compose
+        run: docker compose up --build -d
+
+      - name: Wait for both services to become healthy
+        run: |
+          for i in $(seq 1 30); do
+            api_ok=false; dash_ok=false
+            curl -sf http://localhost:8000/health > /dev/null && api_ok=true
+            curl -sf http://localhost:8501/_stcore/health > /dev/null && dash_ok=true
+            if $api_ok && $dash_ok; then
+              echo "both services healthy"
+              exit 0
+            fi
+            sleep 2
+          done
+          echo "services did not become healthy in time"
+          docker compose logs
+          exit 1
+
+      - name: API /health returns 200 with the expected body
+        run: curl -sf http://localhost:8000/health | tee /dev/stderr | grep -q '"status":"healthy"'
+
+      - name: Tear down
+        if: always()
+        run: docker compose down

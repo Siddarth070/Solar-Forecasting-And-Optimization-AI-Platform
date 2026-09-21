@@ -1,0 +1,18 @@
+services:
+  # FastAPI serving layer -- overrides the Dockerfile's default CMD.
+  api:
+    build: .
+    command: uvicorn src.api.main:app --host 0.0.0.0 --port 8000
+    ports:
+      - "8000:8000"
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      interval: 30s
+      timeout: 10s
+      start_period: 5s
+
+  # Streamlit dashboard -- uses the Dockerfile's default CMD as-is.
+  dashboard:
+    build: .
+    ports:
+      - "8501:8501"
