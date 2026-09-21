@@ -53,6 +53,17 @@ REPRODUCIBILITY:
   the real evaluation — rolling-origin backtest, baselines, and the
   model-skill/deliverable-skill split — to the SAME file.
 
+ALSO TRAINS (roadmap P1.3): a second, PROBABILISTIC model producing P10/P50/
+  P90 quantile forecasts (xgboost_solar_quantile.json) -- same features,
+  same capacity-fraction target, same train/test rows as the point model
+  above, differing only in objective (multi-output `reg:quantileerror`).
+  Sharing the exact same data means the two models are directly comparable
+  (the quantile model's P50 should track the point model closely) and
+  there is no second, silently-diverging data pipeline to keep in sync.
+  See benchmark.py's pinball-loss + reliability evaluation on the final
+  holdout for the real accuracy check; the metrics printed here are a
+  provisional in-sample sanity check only, same as the point model's.
+
 RUN WITH:
   make train
   (or directly: python -m src.models.train)
@@ -75,6 +86,8 @@ from src.models.model_card import update_model_card
 from src.utils.config_loader import get_plant_config
 
 MODEL_PATH = PROJECT_ROOT / "src" / "models" / "xgboost_solar_v2.json"
+QUANTILE_MODEL_PATH = PROJECT_ROOT / "src" / "models" / "xgboost_solar_quantile.json"
+QUANTILE_LEVELS = [0.1, 0.5, 0.9]
 TARGET_COLUMN = "solar_output_mw"
 
 TRAINING_PLANT_ID = "jaipur_100mw"  # see KNOWN LIMITATION above
@@ -147,6 +160,37 @@ def train():
     model.save_model(str(MODEL_PATH))
     print(f"Saved model to {MODEL_PATH}")
 
+    # ── Probabilistic model (roadmap P1.3): same rows, same target, same
+    # features -- only the objective changes. XGBoost's multi-output
+    # `reg:quantileerror` trains all three quantiles in one booster, which
+    # also keeps P10 <= P50 <= P90 non-crossing by construction far more
+    # reliably than three independently-fit models would.
+    quantile_model = XGBRegressor(
+        objective="reg:quantileerror",
+        quantile_alpha=QUANTILE_LEVELS,
+        n_estimators=300,
+        max_depth=5,
+        learning_rate=0.05,
+        subsample=0.8,
+        colsample_bytree=0.8,
+        random_state=42,
+    )
+    quantile_model.fit(X_train, y_train)
+
+    q_preds = np.clip(quantile_model.predict(X_test), 0, None)
+    q_preds = np.sort(q_preds, axis=1)  # defensive: enforce non-crossing
+    pinball_by_tau = {}
+    for i, tau in enumerate(QUANTILE_LEVELS):
+        diff = y_test.to_numpy() - q_preds[:, i]
+        pinball_by_tau[str(tau)] = round(
+            100 * float(np.mean(np.maximum(tau * diff, (tau - 1) * diff))), 4
+        )
+    print(f"\n[Quantile model, PROVISIONAL split] Pinball loss (x100, capacity-fraction units) "
+          f"by quantile: {pinball_by_tau}")
+
+    quantile_model.save_model(str(QUANTILE_MODEL_PATH))
+    print(f"Saved quantile model to {QUANTILE_MODEL_PATH}")
+
     card = update_model_card(
         model_path=MODEL_PATH.name,
         plant_id=TRAINING_PLANT_ID,
@@ -174,6 +218,19 @@ def train():
             "note": "not the real evaluation -- see benchmark.py's rolling-origin backtest "
                     "and final holdout in this same file, under rolling_origin_backtest / "
                     "final_holdout",
+        },
+        quantile_model={
+            "model_path": QUANTILE_MODEL_PATH.name,
+            "quantile_levels": QUANTILE_LEVELS,
+            "objective": "reg:quantileerror (single multi-output booster, non-crossing by construction)",
+            "target": "capacity_factor, same as the point model above",
+            "provisional_split_pinball_loss_x100": {
+                "split": "80/20 chronological, provisional only, same rows as the point model",
+                "note": "not the real evaluation -- see benchmark.py's quantile_holdout_eval "
+                        "in this same file, under quantile_final_holdout, for pinball loss "
+                        "and reliability (P10/P50/P90 coverage) on a real holdout",
+                **pinball_by_tau,
+            },
         },
     )
     print(f"Updated model card for {plant_config['name']} at src/models/model_card.json "

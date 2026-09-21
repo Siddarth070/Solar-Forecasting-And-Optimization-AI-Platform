@@ -27,7 +27,7 @@
     "nrmse_pct": 1.798,
     "note": "not the real evaluation -- see benchmark.py's rolling-origin backtest and final holdout in this same file, under rolling_origin_backtest / final_holdout"
   },
-  "git_sha": "c3c53b13979aaf5d40ad0744c529c32469a00188",
+  "git_sha": "b34384a67ddf31d0caeff92e11b564a8baa4aff7",
   "rolling_origin_backtest": {
     "n_origins": 48,
     "horizon_hours": 24,
@@ -68,5 +68,56 @@
     }
   },
   "plant_id": "jaipur_100mw",
-  "target": "capacity_factor (solar_output_mw / plant's ac_capacity_mw, range 0-1) -- NOT raw MW. Serving code must multiply predictions by the REQUESTED plant's ac_capacity_mw. This is what lets one model serve multiple differently-sized plants (roadmap P1.1)."
+  "target": "capacity_factor (solar_output_mw / plant's ac_capacity_mw, range 0-1) -- NOT raw MW. Serving code must multiply predictions by the REQUESTED plant's ac_capacity_mw. This is what lets one model serve multiple differently-sized plants (roadmap P1.1).",
+  "quantile_model": {
+    "model_path": "xgboost_solar_quantile.json",
+    "quantile_levels": [
+      0.1,
+      0.5,
+      0.9
+    ],
+    "objective": "reg:quantileerror (single multi-output booster, non-crossing by construction)",
+    "target": "capacity_factor, same as the point model above",
+    "provisional_split_pinball_loss_x100": {
+      "split": "80/20 chronological, provisional only, same rows as the point model",
+      "note": "not the real evaluation -- see benchmark.py's quantile_holdout_eval in this same file, under quantile_final_holdout, for pinball loss and reliability (P10/P50/P90 coverage) on a real holdout",
+      "0.1": 0.2193,
+      "0.5": 0.5612,
+      "0.9": 0.329
+    }
+  },
+  "quantile_final_holdout": {
+    "period": {
+      "start": "2025-06-01",
+      "days": 30,
+      "seed": 99
+    },
+    "quantile_levels": [
+      0.1,
+      0.5,
+      0.9
+    ],
+    "model_skill": {
+      "pinball_loss_pct_capacity": {
+        "0.1": 0.2349,
+        "0.5": 0.2931,
+        "0.9": 0.1586
+      },
+      "coverage_p90": 0.8524,
+      "coverage_p10": 0.8929,
+      "interval_80_coverage": 0.7452,
+      "non_crossing_holds": true
+    },
+    "deliverable_skill": {
+      "pinball_loss_pct_capacity": {
+        "0.1": 0.265,
+        "0.5": 0.3481,
+        "0.9": 0.2006
+      },
+      "coverage_p90": 0.8214,
+      "coverage_p10": 0.9095,
+      "interval_80_coverage": 0.731,
+      "non_crossing_holds": true
+    }
+  }
 }

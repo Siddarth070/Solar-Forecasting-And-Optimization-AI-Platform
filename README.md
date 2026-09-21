@@ -157,10 +157,22 @@ any new feature work. As of this commit:
   — two plants in two states run from the same binary, tested in CI; the
   model trains on capacity FRACTION so one artifact correctly serves
   differently-sized plants); the dashboard's fake sine-wave "demand"
-  curve replaced with an operator-set declared schedule. **Not done:**
-  the 15-minute time-block engine, probabilistic (P10/P50/P90) forecasts,
-  the battery optimizer rewrite, and config-driven DSM rulesets (the
-  last needs verified CERC/SERC regulatory data, not fabricated numbers).
+  curve replaced with an operator-set declared schedule; a resolution-
+  independent 96-block/15-minute time engine (`src/time_blocks.py`,
+  matching India's real grid-scheduling grid); the battery optimizer
+  rewritten as a proper LP with round-trip efficiency, SOC floor/ceiling,
+  a terminal SOC constraint, and an objective that minimizes DSM
+  exposure (deviation from the declared schedule) in both directions,
+  not "unmet demand" only; probabilistic P10/P50/P90 forecasts (a second
+  XGBoost model with a multi-output quantile objective, served alongside
+  the point forecast in `/forecast` and shown as an uncertainty band on
+  the dashboard), validated with pinball loss and a reliability check on
+  the final holdout (see `src/models/model_card.json`'s
+  `quantile_final_holdout`). **Not done:** wiring the 96-block engine and
+  the battery LP's `dt_hours`/efficiency into the live rolling-horizon
+  request path, rolling day-ahead/intraday horizons, and config-driven
+  DSM rulesets (the last needs verified CERC/SERC regulatory data, not
+  fabricated numbers).
 - **Not started:** real customer-file ingestion, loss attribution, and
   any real-plant validation — Phase 2 onward.
 
@@ -171,10 +183,14 @@ any new feature work. As of this commit:
   config/serving layer is plant-agnostic, not that a real Pune-trained
   model exists. That needs a location-aware simulator or real per-plant
   data (Phase 3).
-- The deployed dashboard's battery optimizer is a simple rule-based
-  heuristic, not the PuLP linear program in `src/optimization/` — and
-  that LP itself currently has no round-trip efficiency and only supports
-  hourly (not 15-minute) blocks.
+- The deployed dashboard's battery optimizer is still a simple rule-based
+  heuristic, not the PuLP linear program in `src/optimization/` (which now
+  has round-trip efficiency, SOC floor/ceiling, and a terminal SOC
+  constraint) — wiring the dashboard to call the real LP is not done yet.
+- The probabilistic (P10/P50/P90) model is trained on the same hourly
+  simulator rows as the point model — it is not yet wired onto the
+  96-block/15-minute grid (`src/time_blocks.py`) or into rolling
+  day-ahead/intraday horizons.
 - LSTM and Prophet were explored in `notebooks/` but are not served; only
   XGBoost is in the product path. Those notebooks' own reported metrics
   predate the target-leakage fix and are marked invalid in-notebook.

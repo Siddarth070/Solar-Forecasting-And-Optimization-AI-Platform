@@ -30,6 +30,7 @@ app = FastAPI(
 # JSON, not pickle: a pickle can silently break across library versions
 # and is opaque to review (roadmap P0.6).
 MODEL_PATH = PROJECT_ROOT / "src" / "models" / "xgboost_solar_v2.json"
+QUANTILE_MODEL_PATH = PROJECT_ROOT / "src" / "models" / "xgboost_solar_quantile.json"
 
 if MODEL_PATH.exists():
     model = XGBRegressor()
@@ -38,6 +39,18 @@ if MODEL_PATH.exists():
 else:
     logger.error(f"Model not found at {MODEL_PATH}")
     model = None
+
+# Probabilistic P10/P50/P90 model (roadmap P1.3) -- optional: the point
+# model above remains fully functional without it, so its absence is
+# logged, not fatal.
+if QUANTILE_MODEL_PATH.exists():
+    quantile_model = XGBRegressor()
+    quantile_model.load_model(str(QUANTILE_MODEL_PATH))
+    logger.success(f"Quantile model loaded from {QUANTILE_MODEL_PATH}")
+else:
+    logger.warning(f"Quantile model not found at {QUANTILE_MODEL_PATH} -- "
+                    f"/forecast will omit predictions_p10/p50/p90_mw")
+    quantile_model = None
 
 
 # ── Request/Response schemas ──────────────────────────────────
@@ -81,6 +94,21 @@ class ForecastResponse(BaseModel):
     peak_hour          : int
     total_generation_mwh: float
     generated_at       : str
+    predictions_p10_mw : list[float] = Field(
+        default_factory=list,
+        description="10th-percentile forecast per hour (roadmap P1.3). "
+                     "Empty if the quantile model isn't loaded."
+    )
+    predictions_p50_mw : list[float] = Field(
+        default_factory=list,
+        description="Median (50th-percentile) forecast per hour, from the "
+                     "quantile model -- not identical to predictions_mw, "
+                     "which comes from the separately-trained point model."
+    )
+    predictions_p90_mw : list[float] = Field(
+        default_factory=list,
+        description="90th-percentile forecast per hour (roadmap P1.3)."
+    )
 
 
 class OptimizeRequest(BaseModel):
@@ -185,13 +213,27 @@ def forecast(request: ForecastRequest):
             f"peak {max(predictions):.1f} MW at hour {peak_idx}"
         )
 
+        p10_mw, p50_mw, p90_mw = [], [], []
+        if quantile_model is not None:
+            # Quantile model outputs capacity FRACTION, three columns in
+            # [P10, P50, P90] order -- rescale, then sort defensively so a
+            # rare crossing never produces P10 > P90 (see benchmark.py).
+            q_preds = np.clip(quantile_model.predict(X) * capacity_mw, 0, capacity_mw)
+            q_preds = np.sort(q_preds, axis=1)
+            p10_mw = [round(v, 2) for v in q_preds[:, 0].tolist()]
+            p50_mw = [round(v, 2) for v in q_preds[:, 1].tolist()]
+            p90_mw = [round(v, 2) for v in q_preds[:, 2].tolist()]
+
         return ForecastResponse(
             forecast_hours      = len(predictions),
             predictions_mw      = [round(p, 2) for p in predictions],
             peak_output_mw      = round(max(predictions), 2),
             peak_hour           = peak_idx,
             total_generation_mwh= round(sum(predictions), 2),
-            generated_at        = datetime.now().isoformat()
+            generated_at        = datetime.now().isoformat(),
+            predictions_p10_mw  = p10_mw,
+            predictions_p50_mw  = p50_mw,
+            predictions_p90_mw  = p90_mw,
         )
 
     except Exception as e:

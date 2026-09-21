@@ -69,6 +69,29 @@ def load_model():
 
 model, model_loaded = load_model()
 
+@st.cache_resource
+def load_quantile_model():
+    """Load the P10/P50/P90 quantile model (roadmap P1.3). Optional -- the
+    point forecast above works without it; its absence just means no
+    uncertainty band is shown."""
+    possible_paths = [
+        Path(__file__).resolve().parent / "src" / "models" / "xgboost_solar_quantile.json",
+        Path("/app/src/models/xgboost_solar_quantile.json"),
+        Path("src/models/xgboost_solar_quantile.json"),
+        Path(__file__).resolve().parent.parent / "src" / "models" / "xgboost_solar_quantile.json",
+    ]
+    for path in possible_paths:
+        if path.exists():
+            try:
+                qmodel = XGBRegressor()
+                qmodel.load_model(str(path))
+                return qmodel, True
+            except Exception:
+                continue
+    return None, False
+
+quantile_model, quantile_model_loaded = load_quantile_model()
+
 # ── Weather fetcher ───────────────────────────────────────────
 @st.cache_data(ttl=3600)  # cache for 1 hour, per (latitude, longitude)
 def get_live_weather(latitude: float, longitude: float):
@@ -154,6 +177,29 @@ def run_forecast(weather_data, plant_config, capacity_mw):
     # model correctly serves differently-sized plants.
     predictions = model.predict(X) * capacity_mw
     return np.clip(predictions, 0, capacity_mw).tolist()
+
+# ── Probabilistic forecast (P10/P50/P90) ─────────────────────────
+def run_quantile_forecast(weather_data, plant_config, capacity_mw):
+    """Same feature pipeline as run_forecast, but through the quantile
+    model (roadmap P1.3). Returns None if the quantile model isn't
+    available -- callers must handle that gracefully, not crash."""
+    if quantile_model is None:
+        return None
+
+    timestamps = pd.DatetimeIndex([
+        pd.Timestamp(year=2024, month=h["month"], day=15, hour=h["hour"],
+                     tz="Asia/Kolkata")
+        for h in weather_data
+    ])
+    raw = pd.DataFrame(weather_data, index=timestamps)
+    features = build_features(raw, plant_config)
+    X = features[SERVING_FEATURE_COLUMNS]
+
+    # Three columns [P10, P50, P90], capacity fraction -- rescale, then
+    # sort defensively so a rare crossing never yields P10 > P90.
+    q_preds = np.clip(quantile_model.predict(X) * capacity_mw, 0, capacity_mw)
+    q_preds = np.sort(q_preds, axis=1)
+    return q_preds[:, 0].tolist(), q_preds[:, 1].tolist(), q_preds[:, 2].tolist()
 
 # ── Battery optimizer ─────────────────────────────────────────
 def run_optimization(solar_forecast, declared_schedule_mw,
@@ -282,13 +328,28 @@ with st.sidebar:
     )
 declared_schedule = [declared_schedule_mw] * len(hours)
 
+quantiles = run_quantile_forecast(weather_data, PLANT, PLANT_CAPACITY_MW)
+
 fig1 = go.Figure()
+if quantiles is not None:
+    p10, p50, p90 = quantiles
+    # P10-P90 band drawn first (roadmap P1.3): P90 as the visible boundary,
+    # then P10 filled back down to it -- the standard two-trace band trick,
+    # since Plotly only fills between consecutive traces.
+    fig1.add_trace(go.Scatter(
+        x=hours, y=p90, name='P90', mode='lines',
+        line=dict(width=0), showlegend=False, hoverinfo='skip',
+    ))
+    fig1.add_trace(go.Scatter(
+        x=hours, y=p10, name='P10-P90 range', mode='lines',
+        line=dict(width=0), fill='tonexty', fillcolor='rgba(255,165,0,0.15)',
+    ))
 fig1.add_trace(go.Scatter(
     x=hours, y=predictions,
     name='Solar forecast',
     line=dict(color='orange', width=2),
-    fill='tozeroy',
-    fillcolor='rgba(255,165,0,0.15)'
+    fill='tozeroy' if quantiles is None else None,
+    fillcolor='rgba(255,165,0,0.15)' if quantiles is None else None,
 ))
 fig1.add_trace(go.Scatter(
     x=hours, y=declared_schedule,
