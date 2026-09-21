@@ -156,20 +156,25 @@ def run_forecast(weather_data, plant_config, capacity_mw):
     return np.clip(predictions, 0, capacity_mw).tolist()
 
 # ── Battery optimizer ─────────────────────────────────────────
-def run_optimization(solar_forecast, demand_forecast,
+def run_optimization(solar_forecast, declared_schedule_mw,
                      battery_capacity=50, charge_rate=25,
                      discharge_rate=25, initial_charge=25):
     """
     Simple rule-based battery optimizer.
     No PuLP needed — works on Streamlit Cloud.
+
+    declared_schedule_mw: what the plant committed to deliver to the grid
+    each hour — a real IPP has a schedule, not a "demand" curve to guess
+    at (roadmap P1.6). Set by the operator (see the sidebar), never
+    fabricated by this function.
     """
     results = []
     battery = initial_charge
 
     for t in range(len(solar_forecast)):
         solar   = solar_forecast[t]
-        demand  = demand_forecast[t]
-        surplus = solar - demand
+        schedule = declared_schedule_mw[t]
+        surplus = solar - schedule
 
         charge_amt    = 0.0
         discharge_amt = 0.0
@@ -187,15 +192,15 @@ def run_optimization(solar_forecast, demand_forecast,
             action = "HOLD"
 
         results.append({
-            'hour'               : t,
-            'solar_mw'           : round(solar, 2),
-            'demand_mw'          : round(demand, 2),
-            'surplus_mw'         : round(surplus, 2),
-            'charge_mw'          : round(charge_amt, 2),
-            'discharge_mw'       : round(discharge_amt, 2),
-            'battery_level_mwh'  : round(battery, 2),
-            'grid_balance_mw'    : round(solar + discharge_amt - charge_amt - demand, 2),
-            'action'             : action
+            'hour'                    : t,
+            'solar_mw'                : round(solar, 2),
+            'declared_schedule_mw'    : round(schedule, 2),
+            'surplus_mw'              : round(surplus, 2),
+            'charge_mw'               : round(charge_amt, 2),
+            'discharge_mw'            : round(discharge_amt, 2),
+            'battery_level_mwh'       : round(battery, 2),
+            'grid_balance_mw'         : round(solar + discharge_amt - charge_amt - schedule, 2),
+            'action'                  : action
         })
 
     return pd.DataFrame(results)
@@ -260,10 +265,22 @@ st.divider()
 # ── Forecast chart ────────────────────────────────────────────
 st.subheader("24-Hour Solar Generation Forecast")
 
-demand = [
-    round(40 + 8 * np.sin(np.pi * (h - 6) / 12), 2)
-    for h in hours
-]
+# Declared schedule: what THIS plant committed to deliver to the grid --
+# not a "demand" curve. A solar IPP doesn't have demand, it has a schedule
+# (roadmap P1.6). Previously this was a hardcoded 40 + 8*sin(...) formula
+# fabricated with no relationship to any real plant; there is no synthetic
+# demand anywhere in this dashboard now -- the operator sets their own
+# number below.
+with st.sidebar:
+    st.header("📋 Declared Schedule")
+    declared_schedule_mw = st.slider(
+        "Flat declared schedule (MW)", 0, int(PLANT_CAPACITY_MW),
+        int(PLANT_CAPACITY_MW * 0.4),
+        help="What this plant committed to deliver to the grid for every "
+             "hour today. A single flat value for now — per-hour schedules "
+             "are roadmap P1.5/P2.7."
+    )
+declared_schedule = [declared_schedule_mw] * len(hours)
 
 fig1 = go.Figure()
 fig1.add_trace(go.Scatter(
@@ -274,8 +291,8 @@ fig1.add_trace(go.Scatter(
     fillcolor='rgba(255,165,0,0.15)'
 ))
 fig1.add_trace(go.Scatter(
-    x=hours, y=demand,
-    name='Demand forecast',
+    x=hours, y=declared_schedule,
+    name='Declared schedule',
     line=dict(color='royalblue', width=2, dash='dash')
 ))
 fig1.update_layout(
@@ -301,7 +318,7 @@ with st.sidebar:
     initial_charge   = st.slider("Initial charge (MWh)",   0,  50,  25)
 
 schedule = run_optimization(
-    predictions, demand,
+    predictions, declared_schedule,
     battery_capacity, charge_rate,
     discharge_rate, initial_charge
 )
