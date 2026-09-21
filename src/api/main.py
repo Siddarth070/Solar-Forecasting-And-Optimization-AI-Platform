@@ -85,12 +85,18 @@ class ForecastResponse(BaseModel):
 
 class OptimizeRequest(BaseModel):
     """Request body for optimization endpoint."""
-    solar_forecast_mw : list[float] = Field(..., description="Hourly solar forecast")
-    demand_forecast_mw: list[float] = Field(..., description="Hourly demand forecast")
+    solar_forecast_mw : list[float] = Field(..., description="Solar forecast, one value per block")
+    declared_schedule_mw: list[float] = Field(
+        ..., description="What the plant committed to deliver to the grid, "
+                          "one value per block — not a demand forecast "
+                          "(roadmap P1.6: a solar IPP has a schedule, not demand)."
+    )
     battery_capacity_mwh : float = Field(default=50.0)
     charge_rate_mw       : float = Field(default=25.0)
     discharge_rate_mw    : float = Field(default=25.0)
     initial_charge_mwh   : float = Field(default=25.0)
+    dt_hours              : float = Field(default=0.25, description="Block duration in hours")
+    round_trip_efficiency : float = Field(default=0.90)
 
 
 # ── Endpoints ─────────────────────────────────────────────────
@@ -198,20 +204,24 @@ def optimize(request: OptimizeRequest):
     """
     Run battery dispatch optimization.
 
-    Takes solar and demand forecasts, returns
-    optimal charge/discharge schedule.
+    Takes a solar forecast and the plant's declared delivery schedule,
+    returns a charge/discharge schedule minimizing deviation from that
+    schedule (DSM exposure), not "unmet demand" -- a solar IPP has a
+    schedule, not demand (roadmap P1.6).
     """
     try:
         optimizer = BatteryOptimizer(
-            battery_capacity_mwh = request.battery_capacity_mwh,
-            charge_rate_mw       = request.charge_rate_mw,
-            discharge_rate_mw    = request.discharge_rate_mw,
-            initial_charge_mwh   = request.initial_charge_mwh,
+            battery_capacity_mwh  = request.battery_capacity_mwh,
+            charge_rate_mw        = request.charge_rate_mw,
+            discharge_rate_mw     = request.discharge_rate_mw,
+            initial_charge_mwh    = request.initial_charge_mwh,
+            dt_hours              = request.dt_hours,
+            round_trip_efficiency = request.round_trip_efficiency,
         )
 
         results = optimizer.optimize(
-            solar_forecast  = np.array(request.solar_forecast_mw),
-            demand_forecast = np.array(request.demand_forecast_mw),
+            solar_forecast        = np.array(request.solar_forecast_mw),
+            declared_schedule_mw  = np.array(request.declared_schedule_mw),
         )
 
         schedule_records = []
@@ -222,14 +232,19 @@ def optimize(request: OptimizeRequest):
 
         return {
             "status": "optimal",
-            "hours": int(len(results)),
+            "blocks": int(len(results)),
             "schedule": schedule_records,
             "summary": {
-                "total_charged_mwh": float(round(results['charge_mw'].sum(), 2)),
-                "total_discharged_mwh": float(round(results['discharge_mw'].sum(), 2)),
-                "hours_charging": int((results['action'] == 'CHARGE').sum()),
-                "hours_discharging": int((results['action'] == 'DISCHARGE').sum()),
-                "hours_hold": int((results['action'] == 'HOLD').sum()),
+                # charge_mw/discharge_mw are RATES (MW); multiply by the
+                # block duration to get energy (MWh) -- summing rates
+                # directly only happened to work before P1.5 because Δt
+                # was implicitly always 1 hour.
+                "total_charged_mwh": float(round(results['charge_mw'].sum() * optimizer.dt_hours, 2)),
+                "total_discharged_mwh": float(round(results['discharge_mw'].sum() * optimizer.dt_hours, 2)),
+                "total_deviation_mwh": float(round(results['deviation_mwh'].sum(), 2)),
+                "blocks_charging": int((results['action'] == 'CHARGE').sum()),
+                "blocks_discharging": int((results['action'] == 'DISCHARGE').sum()),
+                "blocks_hold": int((results['action'] == 'HOLD').sum()),
             }
         }
     except Exception as e:
