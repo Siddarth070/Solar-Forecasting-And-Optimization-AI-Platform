@@ -23,9 +23,7 @@ sys.path.insert(0, str(PROJECT_ROOT))
 sys.path.insert(0, str(PROJECT_ROOT.parent))
 
 from src.features.pipeline import build_features, SERVING_FEATURE_COLUMNS
-from src.utils.config_loader import get_config
-
-CONFIG = get_config()
+from src.utils.config_loader import get_plant_config, list_plant_ids
 
 # ── Page config ───────────────────────────────────────────────
 st.set_page_config(
@@ -33,6 +31,17 @@ st.set_page_config(
     page_icon="🌤️",
     layout="wide"
 )
+
+# ── Plant selection (roadmap P1.1 — no hardcoded single location) ──
+plant_ids = list_plant_ids()
+with st.sidebar:
+    st.header("🏭 Plant")
+    selected_plant_id = st.selectbox(
+        "Select plant", plant_ids,
+        format_func=lambda pid: get_plant_config(pid)["name"],
+    )
+PLANT = get_plant_config(selected_plant_id)
+PLANT_CAPACITY_MW = PLANT["capacity"]["ac_capacity_mw"]
 
 # ── Load model ────────────────────────────────────────────────
 @st.cache_resource
@@ -61,17 +70,17 @@ def load_model():
 model, model_loaded = load_model()
 
 # ── Weather fetcher ───────────────────────────────────────────
-@st.cache_data(ttl=3600)  # cache for 1 hour
-def get_live_weather():
+@st.cache_data(ttl=3600)  # cache for 1 hour, per (latitude, longitude)
+def get_live_weather(latitude: float, longitude: float):
     """
-    Fetch real live weather from Open-Meteo for Jaipur.
+    Fetch real live weather from Open-Meteo for the given coordinates.
     Cached for 1 hour — refreshes automatically.
     """
     try:
         url = "https://api.open-meteo.com/v1/forecast"
         params = {
-            "latitude"      : 26.9124,
-            "longitude"     : 75.7873,
+            "latitude"      : latitude,
+            "longitude"     : longitude,
             "hourly"        : [
                 "temperature_2m",
                 "relative_humidity_2m",
@@ -120,28 +129,31 @@ def get_live_weather():
         return records, False
 
 # ── Forecast function ─────────────────────────────────────────
-def run_forecast(weather_data):
+def run_forecast(weather_data, plant_config, capacity_mw):
     """Run XGBoost model on weather data via the canonical feature pipeline
     (src/features/pipeline.py) — no more hand-built, drifting feature dict."""
     if model is None:
         return None
 
     # build_features needs a real timestamp (for the solar-position
-    # clear-sky estimate); weather_data only carries hour + month, so we
-    # anchor to a fixed reference year/day, same approach as the API
-    # (src/api/main.py) — an approximation pending a proper per-timestamp
-    # request shape (P1.2).
+    # clear-sky estimate, using THIS plant's lat/lon); weather_data only
+    # carries hour + month, so we anchor to a fixed reference year/day,
+    # same approach as the API (src/api/main.py) — an approximation
+    # pending a proper per-timestamp request shape (P1.2).
     timestamps = pd.DatetimeIndex([
         pd.Timestamp(year=2024, month=h["month"], day=15, hour=h["hour"],
                      tz="Asia/Kolkata")
         for h in weather_data
     ])
     raw = pd.DataFrame(weather_data, index=timestamps)
-    features = build_features(raw, CONFIG)
+    features = build_features(raw, plant_config)
     X = features[SERVING_FEATURE_COLUMNS]
 
-    predictions = model.predict(X)
-    return np.clip(predictions, 0, 100).tolist()
+    # Model outputs capacity FRACTION (0-1), not MW (see
+    # src/models/train.py) -- rescale by THIS plant's own capacity so one
+    # model correctly serves differently-sized plants.
+    predictions = model.predict(X) * capacity_mw
+    return np.clip(predictions, 0, capacity_mw).tolist()
 
 # ── Battery optimizer ─────────────────────────────────────────
 def run_optimization(solar_forecast, demand_forecast,
@@ -194,7 +206,10 @@ def run_optimization(solar_forecast, demand_forecast,
 
 # Header
 st.title("⚡ Zenith")
-st.caption("Peak solar intelligence for India's grid — Jaipur, Rajasthan")
+st.caption(
+    f"Peak solar intelligence for India's grid — "
+    f"{PLANT['location']['name']}, {PLANT['location']['state']}"
+)
 
 # Model status
 if model_loaded:
@@ -204,12 +219,14 @@ else:
     st.stop()
 
 # Fetch weather
-weather_data, is_live = get_live_weather()
+weather_data, is_live = get_live_weather(
+    PLANT["location"]["latitude"], PLANT["location"]["longitude"]
+)
 
 # Live/demo indicator
 if is_live:
     st.success(
-        f"🌤️ Live weather — Jaipur, Rajasthan | "
+        f"🌤️ Live weather — {PLANT['location']['name']}, {PLANT['location']['state']} | "
         f"Updated: {datetime.now().strftime('%d %b %Y, %I:%M %p IST')}"
     )
 else:
@@ -218,7 +235,7 @@ else:
 st.divider()
 
 # ── Run forecast ──────────────────────────────────────────────
-predictions = run_forecast(weather_data)
+predictions = run_forecast(weather_data, PLANT, PLANT_CAPACITY_MW)
 
 if predictions is None:
     st.error("Forecast failed — model not loaded")
@@ -236,7 +253,7 @@ col1, col2, col3, col4 = st.columns(4)
 col1.metric("Expected Generation", f"{total_gen} MWh")
 col2.metric("Peak Output",         f"{peak_mw} MW")
 col3.metric("Peak Hour",           f"{peak_hour:02d}:00")
-col4.metric("Plant Capacity",      "100 MW")
+col4.metric("Plant Capacity",      f"{PLANT_CAPACITY_MW:.0f} MW")
 
 st.divider()
 

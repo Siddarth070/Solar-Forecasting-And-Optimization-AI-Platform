@@ -33,6 +33,17 @@ WHAT IT TRAINS ON:
   recorded below and in model_card.json, so anyone can rebuild the exact
   training set from this script alone.
 
+KNOWN LIMITATION (roadmap P1.1): this script trains against ONE plant's
+  config (TRAINING_PLANT_ID), and location/capacity now come from
+  configs/plants/<id>.yaml rather than a hardcoded global. But the
+  underlying weather SIMULATOR (generate_jaipur_weather) is still
+  Jaipur-specific — its seasonal/diurnal formulas are calibrated to
+  Jaipur's actual climate, not generic. Pointing TRAINING_PLANT_ID at a
+  different plant (e.g. pune_50mw) would train on that plant's real
+  location/capacity but Jaipur's synthetic weather patterns, which is
+  not a real Pune model. A location-aware simulator, or real per-plant
+  data (roadmap Phase 3), is needed before that's honest.
+
 REPRODUCIBILITY:
   The model is saved as JSON (XGBoost's native format, human-diffable),
   not pickle — a pickle can silently break across library versions and
@@ -61,11 +72,12 @@ from src.features.pipeline import build_features, SERVING_FEATURE_COLUMNS
 from src.ingestion.jaipur_simulator import generate_jaipur_weather
 from src.ingestion.synthetic_forecast import simulate_day_ahead_forecast
 from src.models.model_card import update_model_card
-from src.utils.config_loader import get_config
+from src.utils.config_loader import get_plant_config
 
 MODEL_PATH = PROJECT_ROOT / "src" / "models" / "xgboost_solar_v2.json"
 TARGET_COLUMN = "solar_output_mw"
 
+TRAINING_PLANT_ID = "jaipur_100mw"  # see KNOWN LIMITATION above
 TRAINING_START = "2024-01-01"
 TRAINING_DAYS = 365
 TRAINING_WEATHER_SEED = 42  # generate_jaipur_weather's own default
@@ -73,15 +85,26 @@ TRAINING_FORECAST_NOISE_SEED = 7  # distinct from benchmark.py's holdout seeds (
 
 
 def train():
-    config = get_config()
+    plant_config = get_plant_config(TRAINING_PLANT_ID)
+    capacity_mw = plant_config["capacity"]["ac_capacity_mw"]
 
     true_weather = generate_jaipur_weather(
         start_date=TRAINING_START, days=TRAINING_DAYS, seed=TRAINING_WEATHER_SEED
     )
     forecast_quality = simulate_day_ahead_forecast(true_weather, seed=TRAINING_FORECAST_NOISE_SEED)
-    featured = build_features(forecast_quality, config).dropna(
+    featured = build_features(forecast_quality, plant_config).dropna(
         subset=[*SERVING_FEATURE_COLUMNS, TARGET_COLUMN]
     )
+    # Train on CAPACITY FACTOR (0-1, target / this plant's AC capacity), not
+    # raw MW. A model trained on absolute MW learns Jaipur's specific scale
+    # and produces nonsense when served for a differently-sized plant (found
+    # by actually testing pune_50mw through the API: it predicted ~49 MW,
+    # nearly identical to jaipur_100mw's ~49 MW, because the model has no
+    # notion of "this plant's capacity" — only clipping at the ceiling
+    # papers over it). Serving code multiplies back by the REQUESTED plant's
+    # capacity (src/api/main.py, dashboard/app.py), so one model genuinely
+    # generalizes across differently-sized plants.
+    featured[TARGET_COLUMN] = featured[TARGET_COLUMN] / capacity_mw
 
     # Simple chronological split — a placeholder honesty check only. The
     # real evaluation (rolling-origin backtest, baselines, nMAE/nRMSE,
@@ -102,12 +125,11 @@ def train():
     )
     model.fit(X_train, y_train)
 
+    # y_test/predictions are capacity fraction (0-1); nMAE/nRMSE as a % of
+    # capacity is just that fraction * 100 — no separate division needed.
     predictions = np.clip(model.predict(X_test), 0, None)
-    mae = mean_absolute_error(y_test, predictions)
-    rmse = np.sqrt(mean_squared_error(y_test, predictions))
-    capacity_mw = config["solar_plant"]["capacity_mw"]
-    nmae_pct = 100 * mae / capacity_mw
-    nrmse_pct = 100 * rmse / capacity_mw
+    nmae_pct = 100 * mean_absolute_error(y_test, predictions)
+    nrmse_pct = 100 * np.sqrt(mean_squared_error(y_test, predictions))
 
     print(f"Trained on {len(X_train)} rows, held out {len(X_test)} rows (last 20%, chronological).")
     print("[PROVISIONAL split -- see benchmark.py / model_card.json for the real evaluation]")
@@ -127,6 +149,7 @@ def train():
 
     card = update_model_card(
         model_path=MODEL_PATH.name,
+        plant_id=TRAINING_PLANT_ID,
         data_window={
             "start": TRAINING_START,
             "days": TRAINING_DAYS,
@@ -138,6 +161,10 @@ def train():
                       "by re-running `make train`)",
         },
         feature_list=SERVING_FEATURE_COLUMNS,
+        target="capacity_factor (solar_output_mw / plant's ac_capacity_mw, range 0-1) "
+               "-- NOT raw MW. Serving code must multiply predictions by the REQUESTED "
+               "plant's ac_capacity_mw. This is what lets one model serve multiple "
+               "differently-sized plants (roadmap P1.1).",
         train_test_split_metrics={
             "split": "80/20 chronological, provisional only",
             "n_train": len(X_train),
@@ -149,7 +176,7 @@ def train():
                     "final_holdout",
         },
     )
-    print(f"Updated {config['project']['name']} model card at src/models/model_card.json "
+    print(f"Updated model card for {plant_config['name']} at src/models/model_card.json "
           f"(git_sha={card['git_sha'][:12]})")
 
 

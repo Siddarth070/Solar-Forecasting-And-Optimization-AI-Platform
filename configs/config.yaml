@@ -7,18 +7,13 @@
 project:
   name: "Solar Forecast Platform"
   version: "0.1.0"
-  location: "Jaipur, Rajasthan"
   timezone: "Asia/Kolkata"
 
-# Target location for MVP
-location:
-  name: "Jaipur"
-  state: "Rajasthan"
-  latitude: 26.9124
-  longitude: 75.7873
-  elevation_m: 431
-  # Rajasthan has one of the highest solar irradiance levels in India
-  # Annual GHI: ~5.5 - 6.0 kWh/m²/day — ideal for solar forecasting MVP
+# Per-plant settings (location, capacity, grid/regulatory identifiers) live in
+# configs/plants/<plant_id>.yaml, not here — see src.utils.config_loader.
+# get_plant_config(). Roadmap P1.1: no module should read a single global
+# location, since two plants in two different states must run side by side
+# from the same binary.
 
 # Data sources
 data_sources:
@@ -50,14 +45,6 @@ forecasting:
   training_window_days: 90       # Rolling window for model training
   confidence_levels: [0.10, 0.50, 0.90]  # Quantiles for uncertainty
 
-# Solar plant parameters (simulated for MVP)
-solar_plant:
-  capacity_mw: 100               # Simulated 100 MW plant
-  panel_efficiency: 0.20         # 20% — modern monocrystalline panels
-  temperature_coefficient: -0.004  # -0.4%/°C above 25°C (typical)
-  performance_ratio: 0.80        # Real-world losses (wiring, dust, inverter)
-  panel_area_m2: 500000          # Panel area for 100MW at 20% efficiency
-
 # Data pipeline settings
 pipeline:
   raw_data_retention_days: 365
@@ -72,9 +59,10 @@ logging:
   format: "{time:YYYY-MM-DD HH:mm:ss} | {level} | {module} | {message}"
   file: "logs/solar_platform.log"
 
-# Validation thresholds
+# Validation thresholds — generous bounds covering any Indian plant location,
+# not tuned to one site
 validation:
-  max_temperature_c: 55.0        # Jaipur summer max reasonable value
+  max_temperature_c: 55.0
   min_temperature_c: -5.0
   max_irradiance_wm2: 1200.0     # Physical maximum at surface
   min_irradiance_wm2: 0.0

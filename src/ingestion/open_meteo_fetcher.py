@@ -55,13 +55,19 @@ class OpenMeteoFetcher:
 
     Parameters
     ----------
+    plant_config : dict
+        One plant's config (see
+        `src.utils.config_loader.get_plant_config`) — required, not
+        defaulted to a hardcoded location (roadmap P1.1: no module
+        reads a global location).
     config : dict, optional
-        Project config dict. If None, loads from configs/config.yaml
+        Global, plant-agnostic project config. If None, loads from
+        configs/config.yaml.
     """
 
-    def __init__(self, config: dict | None = None):
+    def __init__(self, plant_config: dict, config: dict | None = None):
         self.config   = config or get_config()
-        self.location = self.config["location"]
+        self.location = plant_config["location"]
         self.sources  = self.config["data_sources"]
         self.variables = self.config["weather_variables"]["hourly"]
         self.pipeline  = self.config["pipeline"]

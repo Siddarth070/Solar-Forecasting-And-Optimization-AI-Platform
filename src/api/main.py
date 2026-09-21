@@ -14,14 +14,15 @@ sys.path.insert(0, str(PROJECT_ROOT))
 
 from src.features.pipeline import build_features, SERVING_FEATURE_COLUMNS
 from src.optimization.battery_optimizer import BatteryOptimizer
-from src.utils.config_loader import get_config
+from src.utils.config_loader import get_plant_config, list_plant_ids
 
-CONFIG = get_config()
+DEFAULT_PLANT_ID = "jaipur_100mw"
 
 # ── App setup ─────────────────────────────────────────────────
 app = FastAPI(
     title="Solar Forecast Platform",
-    description="AI-based solar energy forecasting and grid optimization for Jaipur, Rajasthan",
+    description="AI-based solar energy forecasting and grid optimization, "
+                 "for any plant configured under configs/plants/",
     version="1.0.0"
 )
 
@@ -60,9 +61,15 @@ class ForecastRequest(BaseModel):
         max_length=168,
         description="List of hourly weather inputs"
     )
-    plant_capacity_mw: float = Field(
-        default=100.0,
-        description="Solar plant capacity in MW"
+    plant_id: str = Field(
+        default=DEFAULT_PLANT_ID,
+        description="Which configured plant to forecast for — matches a "
+                     "file under configs/plants/. See GET /plants."
+    )
+    plant_capacity_mw: float | None = Field(
+        default=None,
+        description="Override the plant's configured AC capacity (MW). "
+                     "Defaults to the plant's own configured capacity."
     )
 
 
@@ -99,10 +106,18 @@ def health_check():
     }
 
 
+@app.get("/plants")
+def plants():
+    """List configured plant IDs (each backed by configs/plants/<id>.yaml).
+    Pass one of these as `plant_id` in a /forecast request."""
+    return {"plant_ids": list_plant_ids()}
+
+
 @app.post("/forecast", response_model=ForecastResponse)
 def forecast(request: ForecastRequest):
     """
-    Generate solar output forecast from weather inputs.
+    Generate solar output forecast from weather inputs, for one configured
+    plant (see GET /plants).
 
     Takes hourly weather data and returns predicted
     solar generation for each hour.
@@ -114,14 +129,22 @@ def forecast(request: ForecastRequest):
         )
 
     try:
+        plant_config = get_plant_config(request.plant_id)
+    except FileNotFoundError as e:
+        raise HTTPException(status_code=404, detail=str(e))
+
+    capacity_mw = request.plant_capacity_mw or plant_config["capacity"]["ac_capacity_mw"]
+
+    try:
         # Build the feature DataFrame via the single canonical pipeline
         # (src/features/pipeline.py) instead of a hand-built, easily
         # drifting dict. build_features needs a real timestamp (to compute
-        # a solar-position clear-sky estimate); WeatherInput only carries
-        # hour + month, not a full date, so we anchor every request to a
-        # fixed reference year/day. This is an approximation pending P1.2
-        # (a proper per-plant, per-timestamp request schema) — it does not
-        # affect clear-sky GHI meaningfully within a given hour/month.
+        # a solar-position clear-sky estimate, using THIS plant's lat/lon);
+        # WeatherInput only carries hour + month, not a full date, so we
+        # anchor every request to a fixed reference year/day. This is an
+        # approximation pending P1.2 (a proper per-plant, per-timestamp
+        # request schema) — it does not affect clear-sky GHI meaningfully
+        # within a given hour/month.
         timestamps = pd.DatetimeIndex([
             pd.Timestamp(year=2024, month=h.month, day=15, hour=h.hour,
                          tz="Asia/Kolkata")
@@ -139,11 +162,14 @@ def forecast(request: ForecastRequest):
             } for h in request.hours],
             index=timestamps,
         )
-        features = build_features(raw, CONFIG)
+        features = build_features(raw, plant_config)
         X = features[SERVING_FEATURE_COLUMNS]
-        predictions = model.predict(X)
+        # Model outputs capacity FRACTION (0-1), not MW (see
+        # src/models/train.py) -- rescale by the requested plant's own
+        # capacity so one model correctly serves differently-sized plants.
+        predictions = model.predict(X) * capacity_mw
         predictions = np.clip(
-            predictions, 0, request.plant_capacity_mw
+            predictions, 0, capacity_mw
         ).tolist()
 
         peak_idx = int(np.argmax(predictions))

@@ -1,0 +1,43 @@
+# ============================================================
+# Plant configuration — jaipur_100mw
+# ============================================================
+# Loaded via src.utils.config_loader.get_plant_config("jaipur_100mw").
+# Fields under `grid` and `regulatory` are left null: populating them with
+# real values requires verifying current CERC DSM Regulations and the
+# relevant SERC rules first (roadmap P1.7, Ground Rule 4) — not done yet.
+
+plant_id: "jaipur_100mw"
+name: "Jaipur Solar Plant (simulated)"
+
+location:
+  name: "Jaipur"
+  state: "Rajasthan"
+  latitude: 26.9124
+  longitude: 75.7873
+  elevation_m: 431
+  timezone: "Asia/Kolkata"
+  # Rajasthan has one of the highest solar irradiance levels in India —
+  # annual GHI ~5.5-6.0 kWh/m^2/day.
+
+capacity:
+  ac_capacity_mw: 100
+  dc_capacity_mw: 100          # placeholder — DC oversizing not modeled yet
+  panel_efficiency: 0.20       # 20% — modern monocrystalline panels
+  temperature_coefficient: -0.004  # -0.4%/°C above 25°C (typical)
+  performance_ratio: 0.80      # Real-world losses (wiring, dust, inverter)
+  panel_area_m2: 500000        # Panel area for 100 MW at 20% efficiency
+  tilt_deg: null               # not yet used by src/features/pipeline.py
+  azimuth_deg: null            # (flat-plate horizontal GHI model only)
+
+# Grid/regulatory identifiers — not yet configured (roadmap P1.7)
+grid:
+  sldc: null
+  rldc: null
+  ists_or_instate: null
+  qca_role: null
+  metering_point: null
+
+regulatory:
+  dsm_ruleset_id: null
+  schedule_format: null
+  revision_windows: null

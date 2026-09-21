@@ -24,7 +24,7 @@ PROJECT_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(PROJECT_ROOT))
 
 from src.features.pipeline import build_features, SERVING_FEATURE_COLUMNS
-from src.utils.config_loader import get_config
+from src.utils.config_loader import get_plant_config
 
 MODEL_PATH = PROJECT_ROOT / "src" / "models" / "xgboost_solar_v2.json"
 
@@ -59,9 +59,9 @@ def _representative_request_frame() -> pd.DataFrame:
 class TestFeatureServingParity:
     def test_serving_columns_match_model_exactly_and_in_order(self):
         model = _served_model()
-        config = get_config()
+        plant_config = get_plant_config("jaipur_100mw")
 
-        features = build_features(_representative_request_frame(), config)
+        features = build_features(_representative_request_frame(), plant_config)
         served_columns = list(features[SERVING_FEATURE_COLUMNS].columns)
 
         assert served_columns == model.get_booster().feature_names, (
@@ -75,7 +75,7 @@ class TestFeatureServingParity:
         """Every SERVING_FEATURE_COLUMNS value must actually vary with its
         input, not be a literal the serving code fabricated (audit finding
         F2 — 7 of 17 features used to be hardcoded to 0.0)."""
-        config = get_config()
+        plant_config = get_plant_config("jaipur_100mw")
 
         # Span 12 different months at 12 different hours, so both the
         # hour-of-day and month-of-year cyclical encodings have room to
@@ -99,7 +99,7 @@ class TestFeatureServingParity:
             index=index,
         )
 
-        features = build_features(varied_input, config)
+        features = build_features(varied_input, plant_config)
         X = features[SERVING_FEATURE_COLUMNS]
 
         constant_columns = [col for col in X.columns if X[col].nunique() <= 1]
