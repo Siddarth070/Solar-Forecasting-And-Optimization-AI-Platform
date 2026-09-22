@@ -2,9 +2,14 @@
 # Plant configuration — jaipur_100mw
 # ============================================================
 # Loaded via src.utils.config_loader.get_plant_config("jaipur_100mw").
-# Fields under `grid` and `regulatory` are left null: populating them with
-# real values requires verifying current CERC DSM Regulations and the
-# relevant SERC rules first (roadmap P1.7, Ground Rule 4) — not done yet.
+# Fields under `grid` are left null: populating them (SLDC/RLDC/QCA role/
+# metering point identifiers) requires real plant-specific grid-connection
+# facts this simulated demo plant doesn't have. `regulatory` below IS now
+# populated for `seller_category` (a real, verifiable regulatory fact —
+# see src/regulatory/dsm.py) but `contract_rate_rs_per_kwh` remains an
+# illustrative placeholder (see the field's own comment) since a PPA
+# tariff is commercial, plant-specific data the CERC regulations
+# themselves don't specify (roadmap P1.7, Ground Rule 4).
 
 plant_id: "jaipur_100mw"
 name: "Jaipur Solar Plant (simulated)"
@@ -29,7 +34,9 @@ capacity:
   tilt_deg: null               # not yet used by src/features/pipeline.py
   azimuth_deg: null            # (flat-plate horizontal GHI model only)
 
-# Grid/regulatory identifiers — not yet configured (roadmap P1.7)
+# Grid connection identifiers — not yet configured (no real grid-connection
+# data for this simulated demo plant); DSM regulatory fields ARE configured
+# below (roadmap P1.7).
 grid:
   sldc: null
   rldc: null
@@ -38,6 +45,17 @@ grid:
   metering_point: null
 
 regulatory:
-  dsm_ruleset_id: null
+  # CERC (Deviation Settlement Mechanism and Related Matters) Regulations,
+  # 2024, Regulation 8(4) + Note-1 (as amended by the 1st/2nd Amendments,
+  # which don't touch this; the 3rd Amendment is an unfinished draft --
+  # see src/regulatory/dsm.py's module docstring for full citations and
+  # the one real gap it documents rather than fabricates).
+  dsm_ruleset_id: "CERC_DSM_2024_Reg8(4)"
+  seller_category: "solar"   # WS seller sub-category (solar/hybrid vs wind have different Note-1 bands)
+  contract_rate_rs_per_kwh: 2.50  # ILLUSTRATIVE PLACEHOLDER -- this plant is simulated, so there is
+                                  # no real PPA/auction tariff to cite (Regulation 3(1)(j) contract
+                                  # rate is commercial data, not something the DSM regs themselves set).
+                                  # Replace with the plant's actual contracted rate before using this
+                                  # for real settlement decisions.
   schedule_format: null
   revision_windows: null

@@ -10,6 +10,7 @@ RUN WITH:
   pytest tests/test_battery_optimizer.py -v
 """
 
+import datetime as dt
 import sys
 from pathlib import Path
 
@@ -20,6 +21,7 @@ PROJECT_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(PROJECT_ROOT))
 
 from src.optimization.battery_optimizer import BatteryOptimizer
+from src.regulatory import dsm
 
 
 class TestPhysicalRealism:
@@ -155,3 +157,97 @@ class TestFallback:
         df = opt._rule_based_fallback(solar, schedule)
         # 20 MW * 0.25h * charge_eff(0.9) = 4.5 MWh added.
         assert df.loc[0, "battery_level_mwh"] == pytest.approx(14.5, abs=0.05)
+
+
+class TestDsmMode:
+    """Roadmap P1.7: the real CERC Regulation 8(4) WS-seller tiered
+    structure (src/regulatory/dsm.py), wired into the optimizer's
+    objective instead of the flat deviation_penalty_per_mwh, activated
+    only when dsm_contract_rate_rs_per_kwh AND dsm_available_capacity_mw
+    are both supplied."""
+
+    AS_OF = dt.date(2026, 9, 22)  # post-01.04.2026 -- tighter solar bands
+
+    def _opt(self, **overrides):
+        kwargs = dict(
+            battery_capacity_mwh=1000, charge_rate_mw=200, discharge_rate_mw=200,
+            initial_charge_mwh=500, dt_hours=0.25, cycling_cost_per_mwh=0.0,
+            round_trip_efficiency=1.0, soc_floor_pct=0.0, soc_ceiling_pct=1.0,
+            terminal_soc_target_mwh=0,
+            dsm_contract_rate_rs_per_kwh=2.5, dsm_available_capacity_mw=100,
+            dsm_seller_category="solar", dsm_as_of=self.AS_OF,
+        )
+        kwargs.update(overrides)
+        return BatteryOptimizer(**kwargs)
+
+    def test_dsm_mode_is_off_by_default(self):
+        opt = BatteryOptimizer(battery_capacity_mwh=50, charge_rate_mw=25,
+                                discharge_rate_mw=25, initial_charge_mwh=25)
+        assert opt.dsm_enabled is False
+
+    def test_dsm_rs_column_absent_when_dsm_mode_off(self):
+        opt = BatteryOptimizer(battery_capacity_mwh=50, charge_rate_mw=25,
+                                discharge_rate_mw=25, initial_charge_mwh=25)
+        df = opt.optimize(np.array([30.0, 20.0]), np.array([10.0, 10.0]))
+        assert "dsm_rs" not in df.columns
+
+    def test_reported_dsm_rs_matches_independent_recomputation(self):
+        """The optimizer's reported dsm_rs for every block must match
+        calling src/regulatory/dsm.py directly on that block's OWN
+        deviation -- proves there's one source of truth for the charge,
+        not a second, drifting copy of the regulation's math."""
+        opt = self._opt(terminal_soc_target_mwh=500)
+        rng = np.random.default_rng(5)
+        solar = rng.uniform(0, 80, 10)
+        schedule = rng.uniform(0, 60, 10)
+        df = opt.optimize(solar, schedule)
+
+        for _, row in df.iterrows():
+            signed_deviation_mwh = (
+                (row["solar_mw"] + row["discharge_mw"] - row["charge_mw"]) - row["declared_schedule_mw"]
+            ) * opt.dt_hours
+            expected = dsm.deviation_settlement(
+                signed_deviation_mwh, opt.dsm_available_capacity_mwh, 2.5, "solar", self.AS_OF,
+            )["net_rs"]
+            # Reconstructed from the dataframe's own already-rounded (2dp)
+            # MW columns, so a little slack accounts for rounding, not for
+            # a real mismatch between the optimizer and src/regulatory/dsm.py.
+            assert row["dsm_rs"] == pytest.approx(expected, abs=15.0)
+
+    def test_dsm_mode_beats_doing_nothing_on_a_mixed_scenario(self):
+        opt = self._opt()
+        rng = np.random.default_rng(3)
+        solar = rng.uniform(0, 80, 20)
+        schedule = rng.uniform(0, 60, 20)
+        df = opt.optimize(solar, schedule)
+
+        baseline_rs = sum(
+            dsm.deviation_settlement((s - sch) * opt.dt_hours, opt.dsm_available_capacity_mwh,
+                                      2.5, "solar", self.AS_OF)["net_rs"]
+            for s, sch in zip(solar, schedule)
+        )
+        assert df["dsm_rs"].sum() < baseline_rs
+
+    def test_over_injection_revenue_saturates_beyond_vl2(self):
+        """Regulation 8(4): over-injection beyond VLwS(2) is paid at ZERO.
+        So once a block's surplus already exceeds VL2, injecting even
+        MORE surplus must not change that block's settled dsm_rs at all
+        -- a real, solver-tie-independent invariant since it's checked on
+        the REPORTED cost, not on which exact MW split the LP picked."""
+        opt = self._opt(charge_rate_mw=0.0, discharge_rate_mw=0.0)  # isolate: no battery action possible
+        far_beyond_vl2 = opt.dsm_available_capacity_mw * 0.5  # available_capacity_mwh=25, VL2=2.5 MWh -> 10MW; 50MW is far beyond
+        even_further = far_beyond_vl2 * 2
+
+        df_a = opt.optimize(np.array([far_beyond_vl2]), np.array([0.0]))
+        df_b = opt.optimize(np.array([even_further]), np.array([0.0]))
+        assert df_a.loc[0, "dsm_rs"] == pytest.approx(df_b.loc[0, "dsm_rs"])
+
+    def test_under_injection_within_vl1_costs_exactly_contract_rate(self):
+        """A small, deliberately battery-unreachable shortfall (battery
+        rates set to 0) must settle at exactly the contract rate -- the
+        simplest, fully-deterministic case in Regulation 8(4)."""
+        opt = self._opt(charge_rate_mw=0.0, discharge_rate_mw=0.0)
+        # available_capacity_mwh = 100*0.25 = 25; VL1 (5%) = 1.25 MWh.
+        # 4 MW * 0.25h = 1 MWh under-injection, safely within VL1.
+        df = opt.optimize(np.array([16.0]), np.array([20.0]))
+        assert df.loc[0, "dsm_rs"] == pytest.approx(1.0 * 2500 * 1.00)  # 2500 Rs

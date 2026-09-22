@@ -14,7 +14,7 @@ import plotly.graph_objects as go
 import requests
 import sys
 from pathlib import Path
-from datetime import datetime
+from datetime import datetime, date
 from xgboost import XGBRegressor
 
 # ── Path setup ────────────────────────────────────────────────
@@ -24,6 +24,7 @@ sys.path.insert(0, str(PROJECT_ROOT.parent))
 
 from src.features.pipeline import build_features, SERVING_FEATURE_COLUMNS
 from src.utils.config_loader import get_plant_config, list_plant_ids
+from src.regulatory import dsm as _dsm
 
 # ── Page config ───────────────────────────────────────────────
 st.set_page_config(
@@ -384,14 +385,45 @@ schedule = run_optimization(
     discharge_rate, initial_charge
 )
 
+# DSM cost estimate (roadmap P1.7): this heuristic dispatch (above) is NOT
+# solving for DSM cost -- only src/optimization/battery_optimizer.py's real
+# LP does that (served via the API's /optimize?plant_id=... option). This
+# reports what the REAL CERC Regulation 8(4) structure would charge for
+# the heuristic's OWN dispatch decisions, using src/regulatory/dsm.py --
+# the same tested module, not a re-derived copy. dt_hours=1.0 here matches
+# this dashboard's existing hourly (not 15-minute block) resolution.
+regulatory_cfg = PLANT.get("regulatory") or {}
+plant_contract_rate = regulatory_cfg.get("contract_rate_rs_per_kwh")
+dsm_total_rs = None
+if plant_contract_rate is not None:
+    available_capacity_mwh = PLANT_CAPACITY_MW * 1.0  # 1-hour blocks
+    seller_category = regulatory_cfg.get("seller_category", "solar")
+    grid_delivered = schedule["solar_mw"] + schedule["discharge_mw"] - schedule["charge_mw"]
+    signed_deviation_mwh = (grid_delivered - schedule["declared_schedule_mw"]) * 1.0
+    dsm_total_rs = sum(
+        _dsm.deviation_settlement(d, available_capacity_mwh, plant_contract_rate,
+                                   seller_category, date.today())["net_rs"]
+        for d in signed_deviation_mwh
+    )
+
 # Summary metrics
-c1, c2, c3 = st.columns(3)
-c1.metric("Total Charged",
-          f"{schedule['charge_mw'].sum():.1f} MWh")
-c2.metric("Total Discharged",
-          f"{schedule['discharge_mw'].sum():.1f} MWh")
-c3.metric("Hours Active",
-          f"{(schedule['action'] != 'HOLD').sum()}h")
+cols = st.columns(4 if dsm_total_rs is not None else 3)
+cols[0].metric("Total Charged",
+                f"{schedule['charge_mw'].sum():.1f} MWh")
+cols[1].metric("Total Discharged",
+                f"{schedule['discharge_mw'].sum():.1f} MWh")
+cols[2].metric("Hours Active",
+                f"{(schedule['action'] != 'HOLD').sum()}h")
+if dsm_total_rs is not None:
+    cols[3].metric(
+        "Est. DSM Exposure",
+        f"₹{dsm_total_rs:,.0f}",
+        help="Estimated CERC Regulation 8(4) deviation settlement for "
+             "today's dispatch (roadmap P1.7) -- negative means net "
+             "receivable. Uses this plant's configured contract rate, "
+             "which is an illustrative placeholder for this simulated "
+             "plant (see configs/plants/*.yaml)."
+    )
 
 # Battery level chart
 fig2 = go.Figure()

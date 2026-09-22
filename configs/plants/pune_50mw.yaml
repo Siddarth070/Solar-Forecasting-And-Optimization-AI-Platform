@@ -31,7 +31,9 @@ capacity:
   tilt_deg: null
   azimuth_deg: null
 
-# Grid/regulatory identifiers — not yet configured (roadmap P1.7)
+# Grid connection identifiers — not yet configured (no real grid-connection
+# data for this simulated demo plant); DSM regulatory fields ARE configured
+# below (roadmap P1.7).
 grid:
   sldc: null
   rldc: null
@@ -40,6 +42,11 @@ grid:
   metering_point: null
 
 regulatory:
-  dsm_ruleset_id: null
+  # See jaipur_100mw.yaml's comment and src/regulatory/dsm.py's module
+  # docstring for the full CERC citation and the one documented gap
+  # (post-01.04.2026 deviation-% blend weight X, not yet published).
+  dsm_ruleset_id: "CERC_DSM_2024_Reg8(4)"
+  seller_category: "solar"
+  contract_rate_rs_per_kwh: 2.50  # ILLUSTRATIVE PLACEHOLDER -- see jaipur_100mw.yaml
   schedule_format: null
   revision_windows: null

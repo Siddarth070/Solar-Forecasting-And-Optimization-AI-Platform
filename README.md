@@ -100,6 +100,7 @@ a single `docker run` gets the standalone dashboard only.
 │   ├── features/       # pipeline.py — the one feature implementation (training, API, dashboard all import it)
 │   ├── models/         # train.py, model_card.py, the served model + its model card
 │   ├── optimization/   # PuLP-based battery dispatch optimizer (not yet wired into the live dashboard)
+│   ├── regulatory/     # dsm.py — real CERC DSM Regulation 8(4) WS-seller charge structure
 │   └── api/            # FastAPI service (standalone — not used by the deployed dashboard)
 ├── dashboard/          # Standalone Streamlit app — this is what's deployed
 ├── notebooks/          # Archived exploration — see notebooks/README.md (not served, roadmap P1.8)
@@ -168,11 +169,18 @@ any new feature work. As of this commit:
   the point forecast in `/forecast` and shown as an uncertainty band on
   the dashboard), validated with pinball loss and a reliability check on
   the final holdout (see `src/models/model_card.json`'s
-  `quantile_final_holdout`). **Not done:** wiring the 96-block engine and
-  the battery LP's `dt_hours`/efficiency into the live rolling-horizon
-  request path, rolling day-ahead/intraday horizons, and config-driven
-  DSM rulesets (the last needs verified CERC/SERC regulatory data, not
-  fabricated numbers).
+  `quantile_final_holdout`); a config-driven DSM ruleset
+  (`src/regulatory/dsm.py`) implementing the real CERC (Deviation
+  Settlement Mechanism and Related Matters) Regulations, 2024,
+  Regulation 8(4) tiered WS-seller charge structure (as amended — the
+  amendments read don't change this structure; see the module's own
+  docstring for full citations and the one real gap it documents rather
+  than fabricates: CERC's post-01.04.2026 deviation-% blend weight is not
+  yet published), wired into the battery LP's objective (`POST
+  /optimize?plant_id=...`) and reported (not yet optimized-for) on the
+  dashboard. **Not done:** wiring the 96-block engine and the battery
+  LP's `dt_hours`/efficiency into the live rolling-horizon request path,
+  and rolling day-ahead/intraday horizons.
 - **Not started:** real customer-file ingestion, loss attribution, and
   any real-plant validation — Phase 2 onward.
 
@@ -185,8 +193,20 @@ any new feature work. As of this commit:
   data (Phase 3).
 - The deployed dashboard's battery optimizer is still a simple rule-based
   heuristic, not the PuLP linear program in `src/optimization/` (which now
-  has round-trip efficiency, SOC floor/ceiling, and a terminal SOC
-  constraint) — wiring the dashboard to call the real LP is not done yet.
+  has round-trip efficiency, SOC floor/ceiling, a terminal SOC constraint,
+  and the real CERC DSM charge structure) — wiring the dashboard to call
+  the real LP is not done yet; it only *reports* an estimated DSM cost for
+  its own heuristic's dispatch, using `src/regulatory/dsm.py`.
+- `contract_rate_rs_per_kwh` in `configs/plants/*.yaml` is an illustrative
+  placeholder (Rs 2.50/kWh), not a real PPA/auction tariff — these are
+  simulated demo plants with no real commercial contract to cite. The DSM
+  *rate structure* itself (`src/regulatory/dsm.py`) is real and verified
+  against the CERC regulation text; only this one commercial input needs
+  a real number before the Rs figures mean anything for an actual plant.
+- CERC's post-01.04.2026 deviation-% blend weight ("X" in Regulation
+  6(2)(b)) has not yet been published by separate order — `dsm.py`
+  documents this and uses the one fully-specified fallback (Available
+  Capacity alone) rather than inventing a value.
 - The probabilistic (P10/P50/P90) model is trained on the same hourly
   simulator rows as the point model — it is not yet wired onto the
   96-block/15-minute grid (`src/time_blocks.py`) or into rolling

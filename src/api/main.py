@@ -125,6 +125,14 @@ class OptimizeRequest(BaseModel):
     initial_charge_mwh   : float = Field(default=25.0)
     dt_hours              : float = Field(default=0.25, description="Block duration in hours")
     round_trip_efficiency : float = Field(default=0.90)
+    plant_id              : str | None = Field(
+        default=None,
+        description="If given, activates real CERC DSM-charge-based "
+                     "optimization (roadmap P1.7) using this plant's "
+                     "configured regulatory.seller_category and "
+                     "regulatory.contract_rate_rs_per_kwh, in place of a "
+                     "flat deviation penalty. See GET /plants."
+    )
 
 
 # ── Endpoints ─────────────────────────────────────────────────
@@ -251,6 +259,26 @@ def optimize(request: OptimizeRequest):
     schedule (DSM exposure), not "unmet demand" -- a solar IPP has a
     schedule, not demand (roadmap P1.6).
     """
+    dsm_kwargs = {}
+    if request.plant_id is not None:
+        try:
+            plant_config = get_plant_config(request.plant_id)
+        except FileNotFoundError as e:
+            raise HTTPException(status_code=404, detail=str(e))
+        regulatory = plant_config.get("regulatory") or {}
+        contract_rate = regulatory.get("contract_rate_rs_per_kwh")
+        if contract_rate is not None:
+            dsm_kwargs = dict(
+                dsm_contract_rate_rs_per_kwh=contract_rate,
+                dsm_available_capacity_mw=plant_config["capacity"]["ac_capacity_mw"],
+                dsm_seller_category=regulatory.get("seller_category", "solar"),
+            )
+        else:
+            logger.warning(
+                f"plant_id={request.plant_id!r} has no regulatory.contract_rate_rs_per_kwh "
+                f"configured -- falling back to the flat deviation_penalty_per_mwh."
+            )
+
     try:
         optimizer = BatteryOptimizer(
             battery_capacity_mwh  = request.battery_capacity_mwh,
@@ -259,6 +287,7 @@ def optimize(request: OptimizeRequest):
             initial_charge_mwh    = request.initial_charge_mwh,
             dt_hours              = request.dt_hours,
             round_trip_efficiency = request.round_trip_efficiency,
+            **dsm_kwargs,
         )
 
         results = optimizer.optimize(
@@ -284,6 +313,8 @@ def optimize(request: OptimizeRequest):
                 "total_charged_mwh": float(round(results['charge_mw'].sum() * optimizer.dt_hours, 2)),
                 "total_discharged_mwh": float(round(results['discharge_mw'].sum() * optimizer.dt_hours, 2)),
                 "total_deviation_mwh": float(round(results['deviation_mwh'].sum(), 2)),
+                **({"total_dsm_rs": float(round(results['dsm_rs'].sum(), 2))}
+                   if optimizer.dsm_enabled else {}),
                 "blocks_charging": int((results['action'] == 'CHARGE').sum()),
                 "blocks_discharging": int((results['action'] == 'DISCHARGE').sum()),
                 "blocks_hold": int((results['action'] == 'HOLD').sum()),

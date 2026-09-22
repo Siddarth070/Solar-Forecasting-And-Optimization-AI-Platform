@@ -42,14 +42,32 @@ WHAT CHANGED:
     physically impossible simultaneous charge+discharge, it just capped
     their sum.
 
-WHAT THIS DOES NOT DO YET (roadmap P1.7, blocked on real regulatory data):
-  `deviation_penalty_per_mwh` is a single flat provisional cost, not the
-  real tiered CERC/SERC deviation-settlement slabs (which charge
-  different rates at different deviation bands, and vary by state and by
-  how far actual frequency was from 50 Hz). Wiring in the real tiered
-  structure is P1.7's job once the regulatory source documents are
-  available — replace `deviation_penalty_per_mwh` there, not here.
+DSM MODE (roadmap P1.7): `deviation_penalty_per_mwh` above is a flat
+  provisional cost — fine for a plant with no configured regulatory data.
+  When `dsm_contract_rate_rs_per_kwh` and `dsm_available_capacity_mw` are
+  BOTH supplied, the objective switches to the REAL tiered CERC
+  (Deviation Settlement Mechanism and Related Matters) Regulations, 2024
+  Regulation 8(4) WS-seller structure instead (see
+  src/regulatory/dsm.py): deviation is split into three volume-limit
+  bands (Note-1) with DIFFERENT Rs/MWh rates for over- vs under-injection,
+  not one flat number. This is exactly LP-representable with plain
+  continuous segment variables and no extra binaries for the rate
+  structure itself: the under-injection (payable) rates increase per band
+  (100% -> 110% -> 200% of contract rate), a CONVEX cost a minimizing LP
+  fills cheapest-segment-first on its own; the over-injection (receivable)
+  rates decrease per band (100% -> 90% -> 0%), a CONCAVE revenue a
+  cost-minimizing LP (revenue enters negated) fills highest-rate-segment-
+  first on its own — both are the "good" cases for a segment
+  decomposition. One binary per block (`is_over_injecting`) IS still
+  needed, not for the rates but to stop the LP reporting a physically
+  impossible simultaneous over- and under-injection in the same block:
+  VLwS(1)'s rate is IDENTICAL for both directions (100% either way), so
+  inflating both segment-1 variables together is objective-value-neutral,
+  and an unconstrained LP could report a nonsensical split even though
+  the true net deviation is unambiguous.
 """
+
+import datetime as _dt
 
 import numpy as np
 import pandas as pd
@@ -61,6 +79,8 @@ except ImportError:
     raise ImportError(
         "PuLP not installed. Run: pip install pulp"
     )
+
+from src.regulatory import dsm as _dsm
 
 
 class BatteryOptimizer:
@@ -77,6 +97,10 @@ class BatteryOptimizer:
         terminal_soc_target_mwh: float | None = None,
         cycling_cost_per_mwh: float = 0.5,
         deviation_penalty_per_mwh: float = 1.0,
+        dsm_contract_rate_rs_per_kwh: float | None = None,
+        dsm_available_capacity_mw: float | None = None,
+        dsm_seller_category: str = "solar",
+        dsm_as_of: _dt.date | None = None,
     ):
         self.capacity        = battery_capacity_mwh
         self.charge_rate     = charge_rate_mw
@@ -106,10 +130,33 @@ class BatteryOptimizer:
         self.cycling_cost_per_mwh      = cycling_cost_per_mwh
         self.deviation_penalty_per_mwh = deviation_penalty_per_mwh
 
+        # DSM mode (roadmap P1.7) is opt-in: both a real contract rate and
+        # a real available capacity must be supplied, or this falls back
+        # to the flat deviation_penalty_per_mwh above unchanged.
+        self.dsm_enabled = (
+            dsm_contract_rate_rs_per_kwh is not None and dsm_available_capacity_mw is not None
+        )
+        self.dsm_contract_rate_rs_per_kwh = dsm_contract_rate_rs_per_kwh
+        self.dsm_available_capacity_mw    = dsm_available_capacity_mw
+        self.dsm_seller_category          = dsm_seller_category
+        self.dsm_as_of                    = dsm_as_of or _dt.date.today()
+        if self.dsm_enabled:
+            # Available Capacity per time block, in MWh (see
+            # src/regulatory/dsm.py's UNITS note).
+            self.dsm_available_capacity_mwh = dsm_available_capacity_mw * dt_hours
+            self.dsm_segments = _dsm.lp_cost_segments(
+                available_capacity_mwh=self.dsm_available_capacity_mwh,
+                contract_rate_rs_per_kwh=dsm_contract_rate_rs_per_kwh,
+                category=dsm_seller_category,
+                as_of=self.dsm_as_of,
+            )
+
         logger.info(
             f"BatteryOptimizer initialised: capacity={self.capacity}MWh, "
             f"dt={self.dt_hours}h, round_trip_eff={round_trip_efficiency:.0%}, "
             f"usable SOC=[{self.soc_floor_mwh:.1f}, {self.soc_ceiling_mwh:.1f}] MWh"
+            + (f", DSM mode ON (contract_rate={dsm_contract_rate_rs_per_kwh} Rs/kWh, "
+               f"category={dsm_seller_category}, as_of={self.dsm_as_of})" if self.dsm_enabled else "")
         )
 
     def optimize(
@@ -133,13 +180,48 @@ class BatteryOptimizer:
         # Mutual exclusivity: charging and discharging in the same block is
         # physically impossible, not just rate-limited.
         is_charging = [pulp.LpVariable(f"is_charging_{t}", cat="Binary") for t in range(n)]
-        # |grid_delivered - declared_schedule| via the standard LP split.
-        deviation = [pulp.LpVariable(f"deviation_{t}", 0, None) for t in range(n)]
 
-        prob += (
-            self.deviation_penalty_per_mwh * pulp.lpSum(deviation) * self.dt_hours
-            + self.cycling_cost_per_mwh * pulp.lpSum(charge[t] + discharge[t] for t in range(n)) * self.dt_hours
-        )
+        cycling_term = self.cycling_cost_per_mwh * pulp.lpSum(
+            charge[t] + discharge[t] for t in range(n)
+        ) * self.dt_hours
+
+        if self.dsm_enabled:
+            # Real tiered CERC Regulation 8(4) structure (see this file's
+            # module docstring and src/regulatory/dsm.py) instead of the
+            # flat deviation_penalty_per_mwh.
+            widths = self.dsm_segments["segment_widths_mwh"]
+            over_rates = self.dsm_segments["over_injection_rates_rs_per_mwh"]
+            under_rates = self.dsm_segments["under_injection_rates_rs_per_mwh"]
+            # A safe Big-M for the mutual-exclusivity constraints below --
+            # derived from the actual data passed in, not a magic constant.
+            big_m = 10 * (
+                float(np.max(solar_forecast)) + float(np.max(declared_schedule_mw))
+                + self.charge_rate + self.discharge_rate + 1.0
+            )
+
+            over1 = [pulp.LpVariable(f"over1_{t}", 0, widths[0]) for t in range(n)]
+            over2 = [pulp.LpVariable(f"over2_{t}", 0, widths[1]) for t in range(n)]
+            over3 = [pulp.LpVariable(f"over3_{t}", 0, None) for t in range(n)]
+            under1 = [pulp.LpVariable(f"under1_{t}", 0, widths[0]) for t in range(n)]
+            under2 = [pulp.LpVariable(f"under2_{t}", 0, widths[1]) for t in range(n)]
+            under3 = [pulp.LpVariable(f"under3_{t}", 0, None) for t in range(n)]
+            # Not needed for the rate structure (see docstring) -- only to
+            # keep the reported split physically unambiguous.
+            is_over_injecting = [pulp.LpVariable(f"is_over_{t}", cat="Binary") for t in range(n)]
+
+            dsm_term = pulp.lpSum(
+                under1[t] * under_rates[0] + under2[t] * under_rates[1] + under3[t] * under_rates[2]
+                - (over1[t] * over_rates[0] + over2[t] * over_rates[1] + over3[t] * over_rates[2])
+                for t in range(n)
+            )
+            prob += dsm_term + cycling_term
+        else:
+            # |grid_delivered - declared_schedule| via the standard LP split.
+            deviation = [pulp.LpVariable(f"deviation_{t}", 0, None) for t in range(n)]
+            prob += (
+                self.deviation_penalty_per_mwh * pulp.lpSum(deviation) * self.dt_hours
+                + cycling_term
+            )
 
         for t in range(n):
             solar = float(solar_forecast[t])
@@ -161,10 +243,19 @@ class BatteryOptimizer:
             prob += charge[t] <= self.charge_rate * is_charging[t]
             prob += discharge[t] <= self.discharge_rate * (1 - is_charging[t])
 
-            # DSM exposure: |actual delivered - declared schedule|.
+            # DSM exposure: actual delivered vs. declared schedule.
             grid_delivered = solar + discharge[t] - charge[t]
-            prob += deviation[t] >= grid_delivered - schedule
-            prob += deviation[t] >= schedule - grid_delivered
+            if self.dsm_enabled:
+                # over/under segments are block ENERGY (MWh, matching
+                # dsm.lp_cost_segments' available_capacity_mwh convention)
+                # -- grid_delivered/schedule are MW rates, so convert.
+                net_deviation_mwh = (over1[t] + over2[t] + over3[t]) - (under1[t] + under2[t] + under3[t])
+                prob += net_deviation_mwh == (grid_delivered - schedule) * self.dt_hours
+                prob += over1[t] + over2[t] + over3[t] <= big_m * is_over_injecting[t]
+                prob += under1[t] + under2[t] + under3[t] <= big_m * (1 - is_over_injecting[t])
+            else:
+                prob += deviation[t] >= grid_delivered - schedule
+                prob += deviation[t] >= schedule - grid_delivered
 
         # Terminal SOC constraint -- don't let the optimizer drain the
         # battery right at the edge of the horizon to look better within it.
@@ -189,7 +280,7 @@ class BatteryOptimizer:
 
             action = "CHARGE" if c > 0.5 else ("DISCHARGE" if d > 0.5 else "HOLD")
 
-            results.append({
+            row = {
                 "solar_mw": round(s, 2),
                 "declared_schedule_mw": round(sched, 2),
                 "surplus_mw": round(s - sched, 2),
@@ -199,7 +290,20 @@ class BatteryOptimizer:
                 "grid_balance_mw": round(grid_delivered - sched, 2),
                 "deviation_mwh": round(abs(grid_delivered - sched) * self.dt_hours, 3),
                 "action": action,
-            })
+            }
+            if self.dsm_enabled:
+                # Recomputed directly from src/regulatory/dsm.py (the same
+                # function tests/test_dsm.py verifies against the
+                # regulation text) rather than read back from the solved
+                # segment variables -- one source of truth for what a
+                # block's deviation actually costs.
+                signed_deviation_mwh = (grid_delivered - sched) * self.dt_hours
+                settlement = _dsm.deviation_settlement(
+                    signed_deviation_mwh, self.dsm_available_capacity_mwh,
+                    self.dsm_contract_rate_rs_per_kwh, self.dsm_seller_category, self.dsm_as_of,
+                )
+                row["dsm_rs"] = round(settlement["net_rs"], 2)
+            results.append(row)
 
         return pd.DataFrame(results)
 
@@ -241,7 +345,7 @@ class BatteryOptimizer:
                 action = "HOLD"
 
             grid_delivered = s + discharge_amt - charge_amt
-            results.append({
+            row = {
                 "solar_mw": round(s, 2),
                 "declared_schedule_mw": round(sched, 2),
                 "surplus_mw": round(surplus, 2),
@@ -251,6 +355,14 @@ class BatteryOptimizer:
                 "grid_balance_mw": round(grid_delivered - sched, 2),
                 "deviation_mwh": round(abs(grid_delivered - sched) * self.dt_hours, 3),
                 "action": action,
-            })
+            }
+            if self.dsm_enabled:
+                signed_deviation_mwh = (grid_delivered - sched) * self.dt_hours
+                settlement = _dsm.deviation_settlement(
+                    signed_deviation_mwh, self.dsm_available_capacity_mwh,
+                    self.dsm_contract_rate_rs_per_kwh, self.dsm_seller_category, self.dsm_as_of,
+                )
+                row["dsm_rs"] = round(settlement["net_rs"], 2)
+            results.append(row)
 
         return pd.DataFrame(results)
