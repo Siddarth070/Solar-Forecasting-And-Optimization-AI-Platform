@@ -192,12 +192,15 @@ any new feature work. As of this commit:
   each window starts, verified against the regulation's own concrete
   worked instance (22:45–23:00 hrs bidding for the 00:00–00:30 delivery
   window). Both served via `POST /schedule/revise` and `GET
-  /schedule/gate-closures` on the real 96-block grid. **Not done:** wiring
-  `/forecast` and `/optimize` themselves onto the 96-block grid (they
-  still operate on a caller-supplied list of blocks with no enforced
-  15-minute/96-block alignment) and a numeric revision-count cap for WS
-  sellers specifically (none of the source documents specify one; see
-  `grid_code.py`'s docstring).
+  /schedule/gate-closures` on the real 96-block grid; `POST /forecast`
+  now takes a real per-reading ISO timestamp instead of the old
+  hour+month pair anchored to a fixed placeholder date, and `POST
+  /optimize` enforces exact 96-block/15-minute alignment (and forces
+  `dt_hours=0.25` to match) whenever an optional `date` is supplied,
+  returning real block-start timestamps — the same alignment
+  `/schedule/revise` already used. **Not done:** a numeric revision-count
+  cap for WS sellers specifically (none of the source documents specify
+  one; see `grid_code.py`'s docstring).
 - **Not started:** real customer-file ingestion, loss attribution, and
   any real-plant validation — Phase 2 onward.
 
@@ -225,9 +228,14 @@ any new feature work. As of this commit:
   documents this and uses the one fully-specified fallback (Available
   Capacity alone) rather than inventing a value.
 - The probabilistic (P10/P50/P90) model is trained on the same hourly
-  simulator rows as the point model — it is not yet wired onto the
-  96-block/15-minute grid (`src/time_blocks.py`) or into rolling
-  day-ahead/intraday horizons.
+  simulator rows as the point model, and `POST /forecast` still returns
+  one prediction per requested (hourly) timestamp, not per 15-minute
+  block — there is no automatic upsampling from an hourly forecast onto
+  the 96-block grid. `POST /optimize` and `POST /schedule/revise` DO
+  enforce that grid on their own inputs, but a caller chaining
+  `/forecast` into either of them today must resample the 12-24 hourly
+  values onto 96 blocks itself (e.g. via `src.time_blocks.
+  integrate_to_blocks`, the same tool P1.2 built for exactly this).
 - `POST /schedule/revise`'s gate-closure timing (`src/regulatory/
   grid_code.py`) is real and verified against a CERC order's own worked
   example, but nothing in this platform yet SUBMITS a real day-ahead

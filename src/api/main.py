@@ -59,14 +59,16 @@ else:
 # ── Request/Response schemas ──────────────────────────────────
 
 class WeatherInput(BaseModel):
-    """Input weather data for one hour."""
+    """Input weather data for one real timestamp (roadmap P1.2/P1.4's
+    96-block grid: a genuine ISO timestamp, not a hour-of-day/month pair
+    anchored to a fake placeholder date)."""
+    timestamp             : str   = Field(..., description="ISO8601 timestamp for this "
+                                           "reading, e.g. '2024-06-01T09:00:00+05:30'.")
     shortwave_radiation   : float = Field(..., ge=0, le=1200, description="GHI in W/m²")
     cloud_cover           : float = Field(..., ge=0, le=100,  description="Cloud cover %")
     temperature_2m        : float = Field(..., ge=-10, le=60, description="Temperature °C")
     relative_humidity_2m  : float = Field(..., ge=0, le=100,  description="Humidity %")
     wind_speed_10m        : float = Field(..., ge=0, le=50,   description="Wind speed m/s")
-    hour                  : int   = Field(..., ge=0, le=23,   description="Hour of day")
-    month                 : int   = Field(..., ge=1, le=12,   description="Month")
 
 
 class ForecastRequest(BaseModel):
@@ -92,9 +94,14 @@ class ForecastRequest(BaseModel):
 class ForecastResponse(BaseModel):
     """Response from forecast endpoint."""
     forecast_hours     : int
+    timestamps         : list[str] = Field(
+        description="The real timestamps each prediction corresponds to, "
+                     "echoing request.hours[i].timestamp in order."
+    )
     predictions_mw     : list[float]
     peak_output_mw     : float
-    peak_hour          : int
+    peak_index         : int = Field(description="Position in predictions_mw/timestamps of the peak.")
+    peak_timestamp     : str
     total_generation_mwh: float
     generated_at       : str
     predictions_p10_mw : list[float] = Field(
@@ -135,6 +142,16 @@ class OptimizeRequest(BaseModel):
                      "configured regulatory.seller_category and "
                      "regulatory.contract_rate_rs_per_kwh, in place of a "
                      "flat deviation penalty. See GET /plants."
+    )
+    date                  : str | None = Field(
+        default=None,
+        description="Calendar date (YYYY-MM-DD) this schedule covers "
+                     f"(roadmap P1.4). If given, solar_forecast_mw and "
+                     f"declared_schedule_mw MUST have exactly {BLOCKS_PER_DAY} "
+                     "entries -- one per real 15-minute block of that date "
+                     "(src/time_blocks.py) -- dt_hours is fixed at 0.25 to "
+                     "match, and the response's schedule rows carry real "
+                     "block-start timestamps."
     )
 
 
@@ -201,8 +218,9 @@ def forecast(request: ForecastRequest):
     Generate solar output forecast from weather inputs, for one configured
     plant (see GET /plants).
 
-    Takes hourly weather data and returns predicted
-    solar generation for each hour.
+    Takes weather data at real timestamps (roadmap P1.4: no more anchoring
+    to a fake placeholder date) and returns predicted solar generation for
+    each one.
     """
     if model is None:
         raise HTTPException(
@@ -221,27 +239,25 @@ def forecast(request: ForecastRequest):
         # Build the feature DataFrame via the single canonical pipeline
         # (src/features/pipeline.py) instead of a hand-built, easily
         # drifting dict. build_features needs a real timestamp (to compute
-        # a solar-position clear-sky estimate, using THIS plant's lat/lon);
-        # WeatherInput only carries hour + month, not a full date, so we
-        # anchor every request to a fixed reference year/day. This is an
-        # approximation pending P1.2 (a proper per-plant, per-timestamp
-        # request schema) — it does not affect clear-sky GHI meaningfully
-        # within a given hour/month.
-        timestamps = pd.DatetimeIndex([
-            pd.Timestamp(year=2024, month=h.month, day=15, hour=h.hour,
-                         tz="Asia/Kolkata")
-            for h in request.hours
-        ])
+        # a solar-position clear-sky estimate, using THIS plant's lat/lon) --
+        # each WeatherInput now carries its own genuine ISO timestamp
+        # (roadmap P1.4), replacing the earlier "anchor every request to a
+        # fixed reference year/day" placeholder this endpoint used before
+        # P1.2's time-block infrastructure existed. hour/month, needed by
+        # build_features' cyclical encodings, are derived from the real
+        # timestamp rather than supplied separately (so they can never
+        # disagree with it).
+        timestamps = pd.DatetimeIndex([pd.Timestamp(h.timestamp) for h in request.hours])
         raw = pd.DataFrame(
             [{
-                "hour": h.hour,
-                "month": h.month,
+                "hour": ts.hour,
+                "month": ts.month,
                 "cloud_cover": h.cloud_cover,
                 "shortwave_radiation": h.shortwave_radiation,
                 "temperature_2m": h.temperature_2m,
                 "relative_humidity_2m": h.relative_humidity_2m,
                 "wind_speed_10m": h.wind_speed_10m,
-            } for h in request.hours],
+            } for h, ts in zip(request.hours, timestamps)],
             index=timestamps,
         )
         features = build_features(raw, plant_config)
@@ -258,7 +274,7 @@ def forecast(request: ForecastRequest):
 
         logger.info(
             f"Forecast generated: {len(predictions)} hours, "
-            f"peak {max(predictions):.1f} MW at hour {peak_idx}"
+            f"peak {max(predictions):.1f} MW at {timestamps[peak_idx].isoformat()}"
         )
 
         p10_mw, p50_mw, p90_mw = [], [], []
@@ -274,9 +290,11 @@ def forecast(request: ForecastRequest):
 
         return ForecastResponse(
             forecast_hours      = len(predictions),
+            timestamps          = [ts.isoformat() for ts in timestamps],
             predictions_mw      = [round(p, 2) for p in predictions],
             peak_output_mw      = round(max(predictions), 2),
-            peak_hour           = peak_idx,
+            peak_index          = peak_idx,
+            peak_timestamp      = timestamps[peak_idx].isoformat(),
             total_generation_mwh= round(sum(predictions), 2),
             generated_at        = datetime.now().isoformat(),
             predictions_p10_mw  = p10_mw,
@@ -298,7 +316,23 @@ def optimize(request: OptimizeRequest):
     returns a charge/discharge schedule minimizing deviation from that
     schedule (DSM exposure), not "unmet demand" -- a solar IPP has a
     schedule, not demand (roadmap P1.6).
+
+    If `date` is given, both input lists must align to the real 96-block/
+    15-minute grid (roadmap P1.4, src/time_blocks.py) -- exactly 96
+    entries, and dt_hours is fixed at 0.25 regardless of what was passed.
     """
+    block_starts = None
+    if request.date is not None:
+        if len(request.solar_forecast_mw) != BLOCKS_PER_DAY or len(request.declared_schedule_mw) != BLOCKS_PER_DAY:
+            raise HTTPException(
+                status_code=422,
+                detail=f"date={request.date!r} given: solar_forecast_mw and declared_schedule_mw "
+                       f"must each have exactly {BLOCKS_PER_DAY} entries (one per real 15-minute "
+                       f"block of that date), got {len(request.solar_forecast_mw)} and "
+                       f"{len(request.declared_schedule_mw)}."
+            )
+        block_starts = block_boundaries(request.date)[:-1]  # 96 block-start timestamps
+
     dsm_kwargs = {}
     if request.plant_id is not None:
         try:
@@ -325,7 +359,7 @@ def optimize(request: OptimizeRequest):
             charge_rate_mw        = request.charge_rate_mw,
             discharge_rate_mw     = request.discharge_rate_mw,
             initial_charge_mwh    = request.initial_charge_mwh,
-            dt_hours              = request.dt_hours,
+            dt_hours              = 0.25 if block_starts is not None else request.dt_hours,
             round_trip_efficiency = request.round_trip_efficiency,
             **dsm_kwargs,
         )
@@ -336,9 +370,11 @@ def optimize(request: OptimizeRequest):
         )
 
         schedule_records = []
-        for record in results.to_dict(orient="records"):
+        for i, record in enumerate(results.to_dict(orient="records")):
             clean = {k: float(v) if hasattr(v, 'item') else v
                      for k, v in record.items()}
+            if block_starts is not None:
+                clean["block_start"] = block_starts[i].isoformat()
             schedule_records.append(clean)
 
         return {

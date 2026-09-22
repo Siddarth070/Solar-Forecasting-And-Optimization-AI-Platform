@@ -138,9 +138,10 @@ class TestServedQuantileModel:
 
         client = TestClient(app)
         hours = [{
+            "timestamp": f"2024-06-01T{8 + i:02d}:00:00+05:30",
             "shortwave_radiation": 400 + 30 * i, "cloud_cover": 15,
             "temperature_2m": 32, "relative_humidity_2m": 35,
-            "wind_speed_10m": 3, "hour": 8 + i, "month": 6,
+            "wind_speed_10m": 3,
         } for i in range(6)]
 
         resp = client.post("/forecast", json={"hours": hours, "plant_id": "jaipur_100mw"})
@@ -165,8 +166,9 @@ class TestServedQuantileModel:
 
         client = TestClient(app)
         hours = [{
+            "timestamp": "2024-05-01T12:00:00+05:30",
             "shortwave_radiation": 700, "cloud_cover": 5, "temperature_2m": 35,
-            "relative_humidity_2m": 30, "wind_speed_10m": 3, "hour": 12, "month": 5,
+            "relative_humidity_2m": 30, "wind_speed_10m": 3,
         }]
 
         jaipur = client.post("/forecast", json={"hours": hours, "plant_id": "jaipur_100mw"}).json()
