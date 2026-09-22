@@ -114,3 +114,33 @@ class TestReviseScheduleEndpoint:
             "request_timestamp": "2024-06-01T13:56:00+05:30",
         })
         assert resp.status_code == 422
+
+
+class TestGateClosuresEndpoint:
+    """GET /schedule/gate-closures -- both the bilateral Regulation 49(8)
+    revision timing and the Real-Time Market Regulation 49(1)(q) gate
+    closure, exercised end to end."""
+
+    def test_returns_both_mechanisms_correctly(self, client):
+        resp = client.get("/schedule/gate-closures", params={
+            "timestamp": "2024-06-01T13:56:00+05:30",
+            "plant_id": "jaipur_100mw",
+        })
+        assert resp.status_code == 200
+        data = resp.json()
+
+        assert data["transaction_type"] == "bilateral"
+        assert data["bilateral_revision"]["allowed"] is True
+        assert data["bilateral_revision"]["effective_timestamp"] == "2024-06-01T15:30:00+05:30"
+
+        rtm = data["real_time_market"]
+        assert rtm["delivery_window_start"] == "2024-06-01T13:30:00+05:30"
+        assert rtm["bid_window_open"] == "2024-06-01T12:15:00+05:30"
+        assert rtm["gate_closure"] == "2024-06-01T12:30:00+05:30"
+
+    def test_unknown_plant_returns_404(self, client):
+        resp = client.get("/schedule/gate-closures", params={
+            "timestamp": "2024-06-01T13:56:00+05:30",
+            "plant_id": "does_not_exist",
+        })
+        assert resp.status_code == 404

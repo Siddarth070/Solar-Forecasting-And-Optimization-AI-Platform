@@ -14,6 +14,7 @@ sys.path.insert(0, str(PROJECT_ROOT))
 
 from src.features.pipeline import build_features, SERVING_FEATURE_COLUMNS
 from src.optimization.battery_optimizer import BatteryOptimizer
+from src.regulatory import grid_code
 from src.scheduling.rolling_horizon import apply_schedule_revision
 from src.time_blocks import BLOCKS_PER_DAY, block_boundaries
 from src.utils.config_loader import get_plant_config, list_plant_ids
@@ -406,4 +407,51 @@ def revise_schedule(request: ReviseScheduleRequest):
         )
     except Exception as e:
         logger.error(f"Schedule revision error: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/schedule/gate-closures")
+def gate_closures(timestamp: str, plant_id: str = DEFAULT_PLANT_ID):
+    """
+    The next real gate-closure instants an operator would actually face at
+    `timestamp` "now" (roadmap P1.4) -- see src/regulatory/grid_code.py.
+
+    Two independent mechanisms, both from CERC IEGC 2023 Regulation 49:
+      - `bilateral_revision`: when a Regulation 49(8) schedule revision
+        requested right now would take effect (Regulation 49(4)(c)) --
+        only usable at all if this plant's configured transaction_type
+        is "bilateral" (see GET /plants and configs/plants/*.yaml).
+      - `real_time_market`: the current half-hour RTM delivery window and
+        its bid-window-open / gate-closure instants (Regulation 49(1)(q)).
+    """
+    try:
+        plant_config = get_plant_config(plant_id)
+    except FileNotFoundError as e:
+        raise HTTPException(status_code=404, detail=str(e))
+
+    revision_windows = (plant_config.get("regulatory") or {}).get("revision_windows") or {}
+    transaction_type = revision_windows.get("transaction_type", "bilateral")
+
+    try:
+        now = pd.Timestamp(timestamp)
+        bilateral_allowed = grid_code.can_revise_schedule(transaction_type)
+
+        return {
+            "timestamp": now.isoformat(),
+            "plant_id": plant_id,
+            "transaction_type": transaction_type,
+            "bilateral_revision": {
+                "allowed": bilateral_allowed,
+                "effective_timestamp": (
+                    grid_code.revision_effective_timestamp(now).isoformat() if bilateral_allowed else None
+                ),
+            },
+            "real_time_market": {
+                "delivery_window_start": grid_code.rtm_delivery_window_start(now).isoformat(),
+                "bid_window_open": grid_code.rtm_bid_window_open_timestamp(now).isoformat(),
+                "gate_closure": grid_code.rtm_gate_closure_timestamp(now).isoformat(),
+            },
+        }
+    except Exception as e:
+        logger.error(f"Gate closure lookup error: {e}")
         raise HTTPException(status_code=500, detail=str(e))

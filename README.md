@@ -186,8 +186,13 @@ any new feature work. As of this commit:
   full 15-minute blocks later, verified against a CERC removal-of-
   difficulties order's own worked numerical example — plus Regulation
   49(8)'s restriction that a WS seller may only revise under a bilateral
-  transaction structure, not a collective one. Served via `POST
-  /schedule/revise` on the real 96-block grid. **Not done:** wiring
+  transaction structure, not a collective one; plus the Real-Time Market
+  (RTM) gate-closure mechanism (Regulation 49(1)(q)) — half-hour delivery
+  windows whose bid window opens 75 minutes and closes 60 minutes before
+  each window starts, verified against the regulation's own concrete
+  worked instance (22:45–23:00 hrs bidding for the 00:00–00:30 delivery
+  window). Both served via `POST /schedule/revise` and `GET
+  /schedule/gate-closures` on the real 96-block grid. **Not done:** wiring
   `/forecast` and `/optimize` themselves onto the 96-block grid (they
   still operate on a caller-supplied list of blocks with no enforced
   15-minute/96-block alignment) and a numeric revision-count cap for WS

@@ -100,3 +100,53 @@ class TestRevisionEligibility:
 
     def test_unknown_transaction_type_cannot_revise(self):
         assert grid_code.can_revise_schedule("something_else") is False
+
+
+class TestRealTimeMarketGateClosure:
+    """Regulation 49(1)(q): RTM trades in half-hour delivery windows; the
+    bid window opens 75 minutes and closes (gate closure) 60 minutes
+    before each window starts. Verified against the regulation's own
+    concrete instance: the 00:00-00:30 delivery window's bid window is
+    22:45-23:00 hrs of the previous day."""
+
+    def test_matches_the_regulations_own_concrete_instance(self):
+        # Any timestamp within the 00:00-00:30 window should resolve the
+        # same way -- using 00:10 here, not 00:00, to prove this isn't
+        # just echoing the window boundary back.
+        delivery = pd.Timestamp("2024-06-02 00:10:00", tz="Asia/Kolkata")
+        assert grid_code.rtm_delivery_window_start(delivery) == pd.Timestamp(
+            "2024-06-02 00:00:00", tz="Asia/Kolkata"
+        )
+        assert grid_code.rtm_bid_window_open_timestamp(delivery) == pd.Timestamp(
+            "2024-06-01 22:45:00", tz="Asia/Kolkata"
+        )
+        assert grid_code.rtm_gate_closure_timestamp(delivery) == pd.Timestamp(
+            "2024-06-01 23:00:00", tz="Asia/Kolkata"
+        )
+
+    def test_windows_repeat_every_half_hour_as_the_regulation_states(self):
+        # "will be repeated every half an hour thereafter" -- check a
+        # window well into the day, not just the first one.
+        delivery = pd.Timestamp("2024-06-01 14:22:00", tz="Asia/Kolkata")
+        assert grid_code.rtm_delivery_window_start(delivery) == pd.Timestamp(
+            "2024-06-01 14:00:00", tz="Asia/Kolkata"
+        )
+        assert grid_code.rtm_gate_closure_timestamp(delivery) == pd.Timestamp(
+            "2024-06-01 13:00:00", tz="Asia/Kolkata"
+        )
+
+    def test_second_half_hour_window_offsets_correctly(self):
+        # 14:35 falls in the 14:30-15:00 window, not 14:00-14:30.
+        delivery = pd.Timestamp("2024-06-01 14:35:00", tz="Asia/Kolkata")
+        assert grid_code.rtm_delivery_window_start(delivery) == pd.Timestamp(
+            "2024-06-01 14:30:00", tz="Asia/Kolkata"
+        )
+        assert grid_code.rtm_gate_closure_timestamp(delivery) == pd.Timestamp(
+            "2024-06-01 13:30:00", tz="Asia/Kolkata"
+        )
+
+    def test_bid_window_is_15_minutes_wide(self):
+        delivery = pd.Timestamp("2024-06-01 09:05:00", tz="Asia/Kolkata")
+        open_ts = grid_code.rtm_bid_window_open_timestamp(delivery)
+        gate_ts = grid_code.rtm_gate_closure_timestamp(delivery)
+        assert gate_ts - open_ts == pd.Timedelta(minutes=15)
