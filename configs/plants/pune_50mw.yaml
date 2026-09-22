@@ -49,4 +49,8 @@ regulatory:
   seller_category: "solar"
   contract_rate_rs_per_kwh: 2.50  # ILLUSTRATIVE PLACEHOLDER -- see jaipur_100mw.yaml
   schedule_format: null
-  revision_windows: null
+  # See jaipur_100mw.yaml's comment and src/regulatory/grid_code.py's
+  # module docstring for the full CERC IEGC 2023 citation.
+  revision_windows:
+    grid_code_ruleset_id: "CERC_IEGC_2023_Reg49"
+    transaction_type: "bilateral"  # ASSUMED -- see jaipur_100mw.yaml

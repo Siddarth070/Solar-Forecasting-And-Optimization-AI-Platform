@@ -14,6 +14,8 @@ sys.path.insert(0, str(PROJECT_ROOT))
 
 from src.features.pipeline import build_features, SERVING_FEATURE_COLUMNS
 from src.optimization.battery_optimizer import BatteryOptimizer
+from src.scheduling.rolling_horizon import apply_schedule_revision
+from src.time_blocks import BLOCKS_PER_DAY, block_boundaries
 from src.utils.config_loader import get_plant_config, list_plant_ids
 
 DEFAULT_PLANT_ID = "jaipur_100mw"
@@ -132,6 +134,43 @@ class OptimizeRequest(BaseModel):
                      "configured regulatory.seller_category and "
                      "regulatory.contract_rate_rs_per_kwh, in place of a "
                      "flat deviation penalty. See GET /plants."
+    )
+
+
+class ReviseScheduleRequest(BaseModel):
+    """Request body for the schedule-revision endpoint (roadmap P1.4)."""
+    plant_id: str = Field(default=DEFAULT_PLANT_ID)
+    date: str = Field(..., description="Calendar date (YYYY-MM-DD) the schedule covers.")
+    locked_schedule_mw: list[float] = Field(
+        ..., min_length=BLOCKS_PER_DAY, max_length=BLOCKS_PER_DAY,
+        description=f"The currently-declared schedule, exactly {BLOCKS_PER_DAY} values "
+                     "(one per 15-minute block, block 1 = 00:00-00:15)."
+    )
+    proposed_schedule_mw: list[float] = Field(
+        ..., min_length=BLOCKS_PER_DAY, max_length=BLOCKS_PER_DAY,
+        description="A candidate revised schedule (e.g. from an updated intraday "
+                     "forecast), same length and block alignment as locked_schedule_mw."
+    )
+    request_timestamp: str = Field(
+        ..., description="ISO timestamp of when this revision is being requested "
+                          "(real time 'now'), e.g. '2024-06-01T13:56:00+05:30'."
+    )
+
+
+class ReviseScheduleResponse(BaseModel):
+    """Response from the schedule-revision endpoint."""
+    applied_schedule_mw: list[float]
+    effective_timestamp: str | None = Field(
+        description="When the revision actually takes effect per CERC IEGC 2023 "
+                     "Regulation 49(4)(c) -- null if the revision wasn't allowed at all."
+    )
+    revision_allowed: bool = Field(
+        description="False if this plant's configured transaction_type isn't "
+                     "'bilateral' (Regulation 49(8) permits revision only for "
+                     "bilateral WS-seller transactions, not collective)."
+    )
+    locked_block_count: int = Field(
+        description="How many of the 96 blocks stayed locked at their old value."
     )
 
 
@@ -322,4 +361,49 @@ def optimize(request: OptimizeRequest):
         }
     except Exception as e:
         logger.error(f"Optimization error: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/schedule/revise", response_model=ReviseScheduleResponse)
+def revise_schedule(request: ReviseScheduleRequest):
+    """
+    Apply a proposed schedule revision under the REAL CERC IEGC 2023 gate-
+    closure timing (roadmap P1.4) -- see src/regulatory/grid_code.py.
+
+    A day-ahead schedule cannot simply be overwritten the moment a better
+    forecast arrives: Regulation 49(4)(c) delays a requested revision by
+    6-7 more full time blocks beyond the block the request itself falls
+    in, and Regulation 49(8) only permits a WS seller to revise at all if
+    it sells under a bilateral transaction structure (this plant's
+    configured regulatory.revision_windows.transaction_type). Blocks
+    before the computed effective timestamp are returned UNCHANGED from
+    locked_schedule_mw regardless of what proposed_schedule_mw says.
+    """
+    try:
+        plant_config = get_plant_config(request.plant_id)
+    except FileNotFoundError as e:
+        raise HTTPException(status_code=404, detail=str(e))
+
+    revision_windows = (plant_config.get("regulatory") or {}).get("revision_windows") or {}
+    transaction_type = revision_windows.get("transaction_type", "bilateral")
+
+    try:
+        edges = block_boundaries(request.date)[:-1]  # 96 block-start timestamps
+        locked = pd.Series(request.locked_schedule_mw, index=edges)
+        proposed = pd.Series(request.proposed_schedule_mw, index=edges)
+
+        result = apply_schedule_revision(
+            locked, proposed, request.request_timestamp, transaction_type=transaction_type,
+        )
+
+        return ReviseScheduleResponse(
+            applied_schedule_mw = [round(v, 2) for v in result["applied_schedule"].tolist()],
+            effective_timestamp = (
+                result["effective_timestamp"].isoformat() if result["effective_timestamp"] is not None else None
+            ),
+            revision_allowed    = result["revision_allowed"],
+            locked_block_count  = result["locked_block_count"],
+        )
+    except Exception as e:
+        logger.error(f"Schedule revision error: {e}")
         raise HTTPException(status_code=500, detail=str(e))

@@ -100,7 +100,8 @@ a single `docker run` gets the standalone dashboard only.
 │   ├── features/       # pipeline.py — the one feature implementation (training, API, dashboard all import it)
 │   ├── models/         # train.py, model_card.py, the served model + its model card
 │   ├── optimization/   # PuLP-based battery dispatch optimizer (not yet wired into the live dashboard)
-│   ├── regulatory/     # dsm.py — real CERC DSM Regulation 8(4) WS-seller charge structure
+│   ├── regulatory/     # dsm.py (DSM charges) + grid_code.py (revision/gate-closure timing) — real CERC rules
+│   ├── scheduling/     # rolling_horizon.py — applies a schedule revision under grid_code.py's gate-closure timing
 │   └── api/            # FastAPI service (standalone — not used by the deployed dashboard)
 ├── dashboard/          # Standalone Streamlit app — this is what's deployed
 ├── notebooks/          # Archived exploration — see notebooks/README.md (not served, roadmap P1.8)
@@ -178,9 +179,20 @@ any new feature work. As of this commit:
   than fabricates: CERC's post-01.04.2026 deviation-% blend weight is not
   yet published), wired into the battery LP's objective (`POST
   /optimize?plant_id=...`) and reported (not yet optimized-for) on the
-  dashboard. **Not done:** wiring the 96-block engine and the battery
-  LP's `dt_hours`/efficiency into the live rolling-horizon request path,
-  and rolling day-ahead/intraday horizons.
+  dashboard; rolling day-ahead/intraday horizons (`src/regulatory/
+  grid_code.py`, `src/scheduling/rolling_horizon.py`) implementing the
+  real CERC Indian Electricity Grid Code (IEGC) 2023 Regulation 49(4)(c)
+  gate-closure rule — a requested schedule revision only takes effect 6-7
+  full 15-minute blocks later, verified against a CERC removal-of-
+  difficulties order's own worked numerical example — plus Regulation
+  49(8)'s restriction that a WS seller may only revise under a bilateral
+  transaction structure, not a collective one. Served via `POST
+  /schedule/revise` on the real 96-block grid. **Not done:** wiring
+  `/forecast` and `/optimize` themselves onto the 96-block grid (they
+  still operate on a caller-supplied list of blocks with no enforced
+  15-minute/96-block alignment) and a numeric revision-count cap for WS
+  sellers specifically (none of the source documents specify one; see
+  `grid_code.py`'s docstring).
 - **Not started:** real customer-file ingestion, loss attribution, and
   any real-plant validation — Phase 2 onward.
 
@@ -211,6 +223,14 @@ any new feature work. As of this commit:
   simulator rows as the point model — it is not yet wired onto the
   96-block/15-minute grid (`src/time_blocks.py`) or into rolling
   day-ahead/intraday horizons.
+- `POST /schedule/revise`'s gate-closure timing (`src/regulatory/
+  grid_code.py`) is real and verified against a CERC order's own worked
+  example, but nothing in this platform yet SUBMITS a real day-ahead
+  schedule to any real Load Despatch Centre — it only enforces the
+  timing rule on schedules the caller supplies. `transaction_type:
+  "bilateral"` in `configs/plants/*.yaml` is an assumption (a solar IPP
+  with a PPA is typically bilateral), not a verified fact about a real
+  plant's actual sale structure.
 - LSTM and Prophet were explored in `notebooks/` but are not served; only
   XGBoost is in the product path. Those notebooks' own reported metrics
   predate the target-leakage fix and are marked invalid in-notebook.

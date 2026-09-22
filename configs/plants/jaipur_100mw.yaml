@@ -58,4 +58,13 @@ regulatory:
                                   # Replace with the plant's actual contracted rate before using this
                                   # for real settlement decisions.
   schedule_format: null
-  revision_windows: null
+  # CERC Indian Electricity Grid Code (IEGC) 2023, Regulation 49(8)/49(4)
+  # (c) -- see src/regulatory/grid_code.py's module docstring for full
+  # citations, including the CERC order this timing is verified against.
+  revision_windows:
+    grid_code_ruleset_id: "CERC_IEGC_2023_Reg49"
+    transaction_type: "bilateral"  # ASSUMED -- a solar IPP with a PPA is typically bilateral, not
+                                    # collective (exchange-only); this is a real regulatory fork in
+                                    # the road (Reg 49(8): only "bilateral" may revise at all) but
+                                    # which side this specific simulated plant is on isn't a fact
+                                    # this codebase has -- replace if the real plant sells collectively.
