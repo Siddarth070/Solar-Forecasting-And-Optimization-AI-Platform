@@ -257,6 +257,15 @@ def attribute_losses(
             expected_std = float(expected_run.std(ddof=0))
             evidence["run_actual_std_mw"] = round(actual_std, 3)
             evidence["run_expected_std_mw"] = round(expected_std, 3)
+            # The run's own start timestamp -- lets a downstream consumer
+            # (e.g. src.recommendations, roadmap P2.6) group every block
+            # of one physical event together, instead of re-deriving
+            # adjacency from timestamps it wasn't given.
+            run_start_timestamp = actual_run.index.min()
+            evidence["run_start_timestamp"] = (
+                run_start_timestamp.isoformat() if hasattr(run_start_timestamp, "isoformat")
+                else str(run_start_timestamp)
+            )
 
             if actual_std <= curtailment_flat_std_mw and expected_std >= actual_std * curtailment_variance_ratio:
                 cause, confidence = CAUSE_CURTAILMENT, "medium"

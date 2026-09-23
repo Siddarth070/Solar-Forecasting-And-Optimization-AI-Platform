@@ -16,6 +16,12 @@ from src.attribution.loss import attribute_losses, daily_performance_ratio, dete
 from src.features.pipeline import build_features, SERVING_FEATURE_COLUMNS
 from src.optimization.battery_optimizer import BatteryOptimizer
 from src.quality.gate import run_quality_checks
+from src.recommendations import store as recommendations_store
+from src.recommendations.engine import (
+    recommend_battery_actions,
+    recommend_inspections,
+    recommend_schedule_revisions,
+)
 from src.regulatory import grid_code
 from src.risk.schedule_risk import score_schedule_risk
 from src.scheduling.rolling_horizon import apply_schedule_revision
@@ -23,6 +29,16 @@ from src.time_blocks import BLOCKS_PER_DAY, block_boundaries
 from src.utils.config_loader import get_plant_config, list_plant_ids
 
 DEFAULT_PLANT_ID = "jaipur_100mw"
+
+
+def get_recommendations_db():
+    """A fresh connection to the recommendation log (roadmap P2.6) on
+    every call -- SQLite handles this cheaply, and it keeps request
+    handling stateless. Tests override this (see
+    tests/test_recommendations_api.py) to point at one shared in-memory
+    connection instead of the real on-disk log."""
+    return recommendations_store.connect()
+
 
 # ── App setup ─────────────────────────────────────────────────
 app = FastAPI(
@@ -254,6 +270,57 @@ class ScheduleRiskRequest(BaseModel):
                      "entries -- one per real 15-minute block of that date -- dt_hours is "
                      "fixed at 0.25, and the response carries real block-start timestamps."
     )
+
+
+class BatteryStateInput(BaseModel):
+    """Current battery state, for the battery-action recommendation rule
+    (roadmap P2.6). Omit entirely to skip that rule (no battery
+    configured for this plant) rather than guessing specs."""
+    soc_mwh: float = Field(..., description="Current state of charge, MWh.")
+    capacity_mwh: float = Field(..., description="Usable battery capacity, MWh.")
+    charge_rate_mw: float = Field(..., description="Maximum charge rate, MW.")
+    discharge_rate_mw: float = Field(..., description="Maximum discharge rate, MW.")
+
+
+class ScheduleRiskInputs(BaseModel):
+    """Same shape as ScheduleRiskRequest, nested here so one
+    /recommendations/generate call can drive both the schedule-revision
+    and battery-action rules, which both need a schedule-risk report."""
+    declared_schedule_mw: list[float] = Field(..., min_length=1)
+    p10_mw: list[float] = Field(..., min_length=1)
+    p50_mw: list[float] = Field(..., min_length=1)
+    p90_mw: list[float] = Field(..., min_length=1)
+    dt_hours: float = Field(default=0.25)
+    as_of: str | None = Field(default=None)
+    date: str | None = Field(default=None)
+
+
+class RecommendationsGenerateRequest(BaseModel):
+    """Request body for the operator-recommendation engine (roadmap
+    P2.6). `schedule_risk` drives the schedule-revision and
+    battery-action rules; `loss_readings` drives the inspection rule.
+    Either or both may be given -- omitting one just skips the rules
+    that need it, rather than erroring."""
+    plant_id: str = Field(default=DEFAULT_PLANT_ID)
+    schedule_risk: ScheduleRiskInputs | None = Field(default=None)
+    loss_readings: list[LossReading] | None = Field(default=None)
+    battery_state: BatteryStateInput | None = Field(default=None)
+    now: str | None = Field(
+        default=None,
+        description="Real 'now' timestamp, for checking whether each high-risk block's "
+                     "revision gate is still open (roadmap P1.4). Without it, schedule-"
+                     "revision recommendations are still produced, but say the gate wasn't "
+                     "checked."
+    )
+
+
+class RecommendationDecisionRequest(BaseModel):
+    """Request body for approving/dismissing a logged recommendation
+    (roadmap P2.6) -- human-approved only, and the decision itself is
+    logged, never silently applied."""
+    decision: str = Field(..., description="'approved' or 'dismissed'.")
+    decided_by: str = Field(..., description="Who made this decision -- required for the audit log.")
+    note: str = Field(default="")
 
 
 # ── Endpoints ─────────────────────────────────────────────────
@@ -687,3 +754,124 @@ def schedule_risk(request: ScheduleRiskRequest):
         raise HTTPException(status_code=422, detail=str(e))
 
     return report.to_dict()
+
+
+@app.post("/recommendations/generate")
+def recommendations_generate(request: RecommendationsGenerateRequest):
+    """
+    Generate operator recommendations (roadmap P2.6) -- schedule
+    revision and battery action from a schedule-risk report (needs
+    `schedule_risk`), inspection from a loss-attribution report (needs
+    `loss_readings`). Every recommendation is logged to the append-only
+    recommendation log (src/recommendations/store.py) as `pending` and
+    returned; NOTHING here is applied automatically -- an operator must
+    separately call POST /recommendations/{id}/decide.
+    """
+    try:
+        plant_config = get_plant_config(request.plant_id)
+    except FileNotFoundError as e:
+        raise HTTPException(status_code=404, detail=str(e))
+
+    generated = []
+
+    if request.schedule_risk is not None:
+        sr = request.schedule_risk
+        lists = [sr.declared_schedule_mw, sr.p10_mw, sr.p50_mw, sr.p90_mw]
+
+        block_starts = None
+        if sr.date is not None:
+            if any(len(l) != BLOCKS_PER_DAY for l in lists):
+                raise HTTPException(
+                    status_code=422,
+                    detail=f"schedule_risk.date={sr.date!r} given: declared_schedule_mw, p10_mw, "
+                           f"p50_mw and p90_mw must each have exactly {BLOCKS_PER_DAY} entries, "
+                           f"got {[len(l) for l in lists]}."
+                )
+            block_starts = block_boundaries(sr.date)[:-1]
+        elif len({len(l) for l in lists}) != 1:
+            raise HTTPException(
+                status_code=422,
+                detail="schedule_risk's declared_schedule_mw, p10_mw, p50_mw and p90_mw must "
+                       f"all have the same length, got {[len(l) for l in lists]}."
+            )
+
+        as_of_str = sr.as_of or sr.date
+        as_of = pd.Timestamp(as_of_str).date() if as_of_str else datetime.now().date()
+        dt_hours = 0.25 if block_starts is not None else sr.dt_hours
+
+        try:
+            risk_report = score_schedule_risk(
+                declared_schedule_mw=sr.declared_schedule_mw,
+                p10_mw=sr.p10_mw, p50_mw=sr.p50_mw, p90_mw=sr.p90_mw,
+                dt_hours=dt_hours, plant_config=plant_config, as_of=as_of,
+                timestamps=block_starts,
+            )
+        except ValueError as e:
+            raise HTTPException(status_code=422, detail=str(e))
+
+        generated += recommend_schedule_revisions(risk_report, plant_config, now=request.now)
+        battery_state = request.battery_state.model_dump() if request.battery_state is not None else None
+        generated += recommend_battery_actions(risk_report, battery_state, dt_hours)
+
+    if request.loss_readings is not None:
+        try:
+            timestamps = pd.DatetimeIndex([pd.Timestamp(r.timestamp) for r in request.loss_readings])
+            loss_df = pd.DataFrame(
+                {
+                    "solar_output_mw": [r.power_mw for r in request.loss_readings],
+                    "shortwave_radiation": [r.ghi_w_m2 for r in request.loss_readings],
+                    "temperature_2m": [r.temperature_c for r in request.loss_readings],
+                },
+                index=timestamps,
+            )
+            loss_report = attribute_losses(loss_df, plant_config)
+        except Exception as e:
+            logger.error(f"Recommendation loss-attribution error: {e}")
+            raise HTTPException(status_code=500, detail=str(e))
+
+        generated += recommend_inspections(loss_report)
+
+    conn = get_recommendations_db()
+    logged = []
+    for rec in generated:
+        rec_id = recommendations_store.log_recommendation(
+            conn,
+            plant_id=request.plant_id,
+            recommendation_type=rec["recommendation_type"],
+            trigger=rec["trigger"],
+            evidence=rec["evidence"],
+            suggested_action=rec["suggested_action"],
+            block_timestamp=rec["timestamp"],
+        )
+        logged.append(recommendations_store.get_recommendation(conn, rec_id))
+
+    return {"generated": len(logged), "recommendations": logged}
+
+
+@app.get("/recommendations")
+def recommendations_list(plant_id: str | None = None, status: str | None = None):
+    """List logged recommendations (roadmap P2.6), newest first. Filter
+    with ?plant_id=... and/or ?status=pending|approved|dismissed."""
+    conn = get_recommendations_db()
+    return {"recommendations": recommendations_store.list_recommendations(conn, plant_id=plant_id, status=status)}
+
+
+@app.post("/recommendations/{recommendation_id}/decide")
+def recommendations_decide(recommendation_id: int, request: RecommendationDecisionRequest):
+    """
+    Record a human operator's explicit approve/dismiss decision on a
+    recommendation (roadmap P2.6). This only logs the decision -- it
+    never itself revises a schedule, moves a battery, or does anything
+    else; that action, if taken, happens outside this platform, by the
+    operator, exactly as the roadmap requires ("never automatic
+    control").
+    """
+    conn = get_recommendations_db()
+    try:
+        return recommendations_store.decide_recommendation(
+            conn, recommendation_id, request.decision, request.decided_by, request.note
+        )
+    except KeyError as e:
+        raise HTTPException(status_code=404, detail=str(e))
+    except ValueError as e:
+        raise HTTPException(status_code=422, detail=str(e))

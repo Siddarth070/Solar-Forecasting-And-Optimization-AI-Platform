@@ -5,6 +5,7 @@ __pycache__/
 data/raw/
 data/processed/
 data/features/
+data/*.db
 .env
 .ipynb_checkpoints/
 mlruns/

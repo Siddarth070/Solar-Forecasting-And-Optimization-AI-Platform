@@ -265,9 +265,35 @@ any new feature work. As of this commit:
   (hand-computed deviation MWh and band per scenario, including a test
   proving the same deviation reads a stricter band after the cutover
   date) plus 7 end-to-end API tests.
-- **Not started:** real customer-file ingestion (P2.1), operator
-  recommendations (P2.6), weekly performance reports (P2.9), and any
-  real-plant validation — rest of Phase 2 onward.
+  An operator-recommendation engine (`src/recommendations/engine.py` +
+  `store.py`, `POST /recommendations/generate`, `GET /recommendations`,
+  `POST /recommendations/{id}/decide`) that turns the already-computed
+  P2.4/P2.5 evidence into concrete suggestions — per the roadmap,
+  **human-approved only, never automatic control**: nothing in this
+  engine writes to a schedule, a battery, or anything else by itself.
+  Three rules: a schedule-revision suggestion for each HIGH-risk block
+  whose real Grid Code revision gate (`src/regulatory/grid_code.py`,
+  roadmap P1.4) is still open — skipped outright, not just gated, for a
+  plant whose configured transaction structure isn't revision-eligible
+  at all (Regulation 49(8)); a battery charge/discharge suggestion for
+  each MEDIUM/HIGH-risk block the plant's actual battery headroom can
+  (even partially) offset, explicitly marked "partial" when it can't
+  fully cover the deviation; and one inspection suggestion per
+  suspected-equipment RUN (grouped by that run's own start timestamp, so
+  one physical fault produces one suggestion, not one per 15-minute
+  block). Every suggestion carries its trigger and the raw evidence that
+  produced it. Approve/dismiss decisions are logged to an append-only
+  SQLite log (`src/recommendations/store.py`) — chosen because this
+  platform has no real database yet (that's roadmap P2.11, a separate
+  architecture decision) and an in-memory log would lose the audit trail
+  on every restart; a later decision can override an earlier one's
+  status without erasing it from the log. Tested with 13 unit tests for
+  the three rules plus 10 for the log (including that a nonexistent
+  recommendation, an unattributed decision, and an invalid decision
+  value all fail loudly) plus 10 end-to-end API tests.
+- **Not started:** real customer-file ingestion (P2.1), weekly
+  performance reports (P2.9), and any real-plant validation — rest of
+  Phase 2 onward.
 
 ## Known Gaps
 
@@ -351,6 +377,18 @@ any new feature work. As of this commit:
   endpoint expects (the same gap already noted for `/forecast` above) —
   a caller must resample first, e.g. via `src.time_blocks.
   integrate_to_blocks`.
+- The operator-recommendation log (`src/recommendations/store.py`) is a
+  single SQLite file on the API server's own disk, not a shared,
+  multi-instance-safe database — fine for one server process (this
+  platform's current deployment shape), but it would need a real
+  database (roadmap P2.11) before running behind more than one API
+  instance. The recommendation rules themselves only see what's already
+  in a P2.4/P2.5 report, so they inherit every gap already documented
+  for those: no per-inverter telemetry behind an "inspection"
+  suggestion, no real grid curtailment feed, and the illustrative
+  contract-rate placeholder behind a schedule-revision suggestion's Rs
+  figures. Nothing here has been exercised against a real operator's
+  actual workflow — only synthetic trigger scenarios.
 
 ---
 
