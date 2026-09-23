@@ -92,15 +92,19 @@ a single `docker run` gets the standalone dashboard only.
 
 ```
 .
-├── configs/            # All configuration — nothing hardcoded in code
+├── configs/
+│   ├── config.yaml     # Global, plant-agnostic settings only
+│   └── plants/         # One YAML per plant (location, capacity) — see src/utils/config_loader.get_plant_config
 ├── src/
 │   ├── ingestion/      # Open-Meteo fetcher, Jaipur data simulator, synthetic forecast-error model
 │   ├── features/       # pipeline.py — the one feature implementation (training, API, dashboard all import it)
 │   ├── models/         # train.py, model_card.py, the served model + its model card
 │   ├── optimization/   # PuLP-based battery dispatch optimizer (not yet wired into the live dashboard)
+│   ├── regulatory/     # dsm.py (DSM charges) + grid_code.py (revision/gate-closure timing) — real CERC rules
+│   ├── scheduling/     # rolling_horizon.py — applies a schedule revision under grid_code.py's gate-closure timing
 │   └── api/            # FastAPI service (standalone — not used by the deployed dashboard)
 ├── dashboard/          # Standalone Streamlit app — this is what's deployed
-├── notebooks/          # Archived exploration: EDA, LSTM/Prophet/ensemble experiments (not served — see Known Gaps)
+├── notebooks/          # Archived exploration — see notebooks/README.md (not served, roadmap P1.8)
 ├── benchmark.py         # Honest evaluation: rolling-origin backtest + baselines
 ├── Makefile             # make train / make benchmark / make test
 └── tests/               # Unit tests, run in CI on every push (.github/workflows/)
@@ -144,24 +148,102 @@ on a Phase 0 credibility checklist (target leakage, train/serve parity,
 honest evaluation, reproducibility, dependency hygiene, this README) before
 any new feature work. As of this commit:
 
-- **Done:** target leakage removed and tested in CI; one shared feature
-  pipeline (no more hand-duplicated feature dicts in the API/dashboard);
-  a feature/serving parity test; the honest evaluation harness above;
-  model-skill vs. deliverable-skill split; reproducible training
-  (`make train`, JSON model format, `model_card.json`); Docker build
-  fixed (non-root, both services start, verified in CI); dependencies
-  fully pinned.
-- **Not started:** per-plant/multi-state configuration, a proper 15-minute
-  time-block engine, probabilistic (P10/P50/P90) forecasts, real
-  customer-file ingestion, loss attribution, and any real-plant
-  validation. All of Phases 1 onward.
+- **Phase 0, done:** target leakage removed and tested in CI; one shared
+  feature pipeline (no more hand-duplicated feature dicts in the
+  API/dashboard); a feature/serving parity test; the honest evaluation
+  harness above; model-skill vs. deliverable-skill split; reproducible
+  training (`make train`, JSON model format, `model_card.json`); Docker
+  build fixed (non-root, both services start, verified in CI);
+  dependencies fully pinned.
+- **Phase 1, partially done:** per-plant configuration (`configs/plants/`
+  — two plants in two states run from the same binary, tested in CI; the
+  model trains on capacity FRACTION so one artifact correctly serves
+  differently-sized plants); the dashboard's fake sine-wave "demand"
+  curve replaced with an operator-set declared schedule; a resolution-
+  independent 96-block/15-minute time engine (`src/time_blocks.py`,
+  matching India's real grid-scheduling grid); the battery optimizer
+  rewritten as a proper LP with round-trip efficiency, SOC floor/ceiling,
+  a terminal SOC constraint, and an objective that minimizes DSM
+  exposure (deviation from the declared schedule) in both directions,
+  not "unmet demand" only; probabilistic P10/P50/P90 forecasts (a second
+  XGBoost model with a multi-output quantile objective, served alongside
+  the point forecast in `/forecast` and shown as an uncertainty band on
+  the dashboard), validated with pinball loss and a reliability check on
+  the final holdout (see `src/models/model_card.json`'s
+  `quantile_final_holdout`); a config-driven DSM ruleset
+  (`src/regulatory/dsm.py`) implementing the real CERC (Deviation
+  Settlement Mechanism and Related Matters) Regulations, 2024,
+  Regulation 8(4) tiered WS-seller charge structure (as amended — the
+  amendments read don't change this structure; see the module's own
+  docstring for full citations and the one real gap it documents rather
+  than fabricates: CERC's post-01.04.2026 deviation-% blend weight is not
+  yet published), wired into the battery LP's objective (`POST
+  /optimize?plant_id=...`) and reported (not yet optimized-for) on the
+  dashboard; rolling day-ahead/intraday horizons (`src/regulatory/
+  grid_code.py`, `src/scheduling/rolling_horizon.py`) implementing the
+  real CERC Indian Electricity Grid Code (IEGC) 2023 Regulation 49(4)(c)
+  gate-closure rule — a requested schedule revision only takes effect 6-7
+  full 15-minute blocks later, verified against a CERC removal-of-
+  difficulties order's own worked numerical example — plus Regulation
+  49(8)'s restriction that a WS seller may only revise under a bilateral
+  transaction structure, not a collective one; plus the Real-Time Market
+  (RTM) gate-closure mechanism (Regulation 49(1)(q)) — half-hour delivery
+  windows whose bid window opens 75 minutes and closes 60 minutes before
+  each window starts, verified against the regulation's own concrete
+  worked instance (22:45–23:00 hrs bidding for the 00:00–00:30 delivery
+  window). Both served via `POST /schedule/revise` and `GET
+  /schedule/gate-closures` on the real 96-block grid; `POST /forecast`
+  now takes a real per-reading ISO timestamp instead of the old
+  hour+month pair anchored to a fixed placeholder date, and `POST
+  /optimize` enforces exact 96-block/15-minute alignment (and forces
+  `dt_hours=0.25` to match) whenever an optional `date` is supplied,
+  returning real block-start timestamps — the same alignment
+  `/schedule/revise` already used. **Not done:** a numeric revision-count
+  cap for WS sellers specifically (none of the source documents specify
+  one; see `grid_code.py`'s docstring).
+- **Not started:** real customer-file ingestion, loss attribution, and
+  any real-plant validation — Phase 2 onward.
 
 ## Known Gaps
 
-- The deployed dashboard's battery optimizer is a simple rule-based
-  heuristic, not the PuLP linear program in `src/optimization/` — and
-  that LP itself currently has no round-trip efficiency and only supports
-  hourly (not 15-minute) blocks.
+- The weather SIMULATOR (`src/ingestion/jaipur_simulator.py`) is still
+  Jaipur-specific — `configs/plants/pune_50mw.yaml` proves the
+  config/serving layer is plant-agnostic, not that a real Pune-trained
+  model exists. That needs a location-aware simulator or real per-plant
+  data (Phase 3).
+- The deployed dashboard's battery optimizer is still a simple rule-based
+  heuristic, not the PuLP linear program in `src/optimization/` (which now
+  has round-trip efficiency, SOC floor/ceiling, a terminal SOC constraint,
+  and the real CERC DSM charge structure) — wiring the dashboard to call
+  the real LP is not done yet; it only *reports* an estimated DSM cost for
+  its own heuristic's dispatch, using `src/regulatory/dsm.py`.
+- `contract_rate_rs_per_kwh` in `configs/plants/*.yaml` is an illustrative
+  placeholder (Rs 2.50/kWh), not a real PPA/auction tariff — these are
+  simulated demo plants with no real commercial contract to cite. The DSM
+  *rate structure* itself (`src/regulatory/dsm.py`) is real and verified
+  against the CERC regulation text; only this one commercial input needs
+  a real number before the Rs figures mean anything for an actual plant.
+- CERC's post-01.04.2026 deviation-% blend weight ("X" in Regulation
+  6(2)(b)) has not yet been published by separate order — `dsm.py`
+  documents this and uses the one fully-specified fallback (Available
+  Capacity alone) rather than inventing a value.
+- The probabilistic (P10/P50/P90) model is trained on the same hourly
+  simulator rows as the point model, and `POST /forecast` still returns
+  one prediction per requested (hourly) timestamp, not per 15-minute
+  block — there is no automatic upsampling from an hourly forecast onto
+  the 96-block grid. `POST /optimize` and `POST /schedule/revise` DO
+  enforce that grid on their own inputs, but a caller chaining
+  `/forecast` into either of them today must resample the 12-24 hourly
+  values onto 96 blocks itself (e.g. via `src.time_blocks.
+  integrate_to_blocks`, the same tool P1.2 built for exactly this).
+- `POST /schedule/revise`'s gate-closure timing (`src/regulatory/
+  grid_code.py`) is real and verified against a CERC order's own worked
+  example, but nothing in this platform yet SUBMITS a real day-ahead
+  schedule to any real Load Despatch Centre — it only enforces the
+  timing rule on schedules the caller supplies. `transaction_type:
+  "bilateral"` in `configs/plants/*.yaml` is an assumption (a solar IPP
+  with a PPA is typically bilateral), not a verified fact about a real
+  plant's actual sale structure.
 - LSTM and Prophet were explored in `notebooks/` but are not served; only
   XGBoost is in the product path. Those notebooks' own reported metrics
   predate the target-leakage fix and are marked invalid in-notebook.

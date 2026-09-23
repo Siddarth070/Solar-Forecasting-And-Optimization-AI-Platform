@@ -23,11 +23,11 @@
     "split": "80/20 chronological, provisional only",
     "n_train": 7008,
     "n_test": 1752,
-    "nmae_pct": 0.972,
-    "nrmse_pct": 1.799,
+    "nmae_pct": 0.97,
+    "nrmse_pct": 1.798,
     "note": "not the real evaluation -- see benchmark.py's rolling-origin backtest and final holdout in this same file, under rolling_origin_backtest / final_holdout"
   },
-  "git_sha": "211534a4da055f48f944714486e0bb416b096599",
+  "git_sha": "b34384a67ddf31d0caeff92e11b564a8baa4aff7",
   "rolling_origin_backtest": {
     "n_origins": 48,
     "horizon_hours": 24,
@@ -36,13 +36,13 @@
       "days": 365
     },
     "averaged_nmae_pct": {
-      "model": 1.341,
+      "model": 1.34,
       "persistence": 2.104,
       "smart_persistence": 2.12,
       "physics": 5.582
     },
     "averaged_nrmse_pct": {
-      "model": 1.803,
+      "model": 1.796,
       "persistence": 2.907,
       "smart_persistence": 2.924,
       "physics": 7.592
@@ -55,16 +55,69 @@
       "seed": 99
     },
     "model_skill_nmae_pct": {
-      "model": 0.558,
+      "model": 0.56,
       "persistence": 0.815,
       "smart_persistence": 0.814,
       "physics": 3.294
     },
     "deliverable_skill_nmae_pct": {
-      "model": 0.639,
+      "model": 0.638,
       "persistence": 0.815,
       "smart_persistence": 0.814,
       "physics": 3.294
+    }
+  },
+  "plant_id": "jaipur_100mw",
+  "target": "capacity_factor (solar_output_mw / plant's ac_capacity_mw, range 0-1) -- NOT raw MW. Serving code must multiply predictions by the REQUESTED plant's ac_capacity_mw. This is what lets one model serve multiple differently-sized plants (roadmap P1.1).",
+  "quantile_model": {
+    "model_path": "xgboost_solar_quantile.json",
+    "quantile_levels": [
+      0.1,
+      0.5,
+      0.9
+    ],
+    "objective": "reg:quantileerror (single multi-output booster, non-crossing by construction)",
+    "target": "capacity_factor, same as the point model above",
+    "provisional_split_pinball_loss_x100": {
+      "split": "80/20 chronological, provisional only, same rows as the point model",
+      "note": "not the real evaluation -- see benchmark.py's quantile_holdout_eval in this same file, under quantile_final_holdout, for pinball loss and reliability (P10/P50/P90 coverage) on a real holdout",
+      "0.1": 0.2193,
+      "0.5": 0.5612,
+      "0.9": 0.329
+    }
+  },
+  "quantile_final_holdout": {
+    "period": {
+      "start": "2025-06-01",
+      "days": 30,
+      "seed": 99
+    },
+    "quantile_levels": [
+      0.1,
+      0.5,
+      0.9
+    ],
+    "model_skill": {
+      "pinball_loss_pct_capacity": {
+        "0.1": 0.2349,
+        "0.5": 0.2931,
+        "0.9": 0.1586
+      },
+      "coverage_p90": 0.8524,
+      "coverage_p10": 0.8929,
+      "interval_80_coverage": 0.7452,
+      "non_crossing_holds": true
+    },
+    "deliverable_skill": {
+      "pinball_loss_pct_capacity": {
+        "0.1": 0.265,
+        "0.5": 0.3481,
+        "0.9": 0.2006
+      },
+      "coverage_p90": 0.8214,
+      "coverage_p10": 0.9095,
+      "interval_80_coverage": 0.731,
+      "non_crossing_holds": true
     }
   }
 }

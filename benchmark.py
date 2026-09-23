@@ -54,9 +54,14 @@ from src.features.pipeline import build_features, SERVING_FEATURE_COLUMNS
 from src.ingestion.jaipur_simulator import generate_jaipur_weather
 from src.ingestion.synthetic_forecast import simulate_day_ahead_forecast
 from src.models.model_card import update_model_card
-from src.utils.config_loader import get_config
+from src.utils.config_loader import get_plant_config
 
 MODEL_PATH = PROJECT_ROOT / "src" / "models" / "xgboost_solar_v2.json"
+QUANTILE_MODEL_PATH = PROJECT_ROOT / "src" / "models" / "xgboost_solar_quantile.json"
+QUANTILE_LEVELS = [0.1, 0.5, 0.9]
+BENCHMARK_PLANT_ID = "jaipur_100mw"  # must match src/models/train.py's TRAINING_PLANT_ID --
+                                     # scoring the served model against a plant it wasn't
+                                     # trained for would be meaningless
 
 # Must match src/models/train.py exactly -- this IS the development period.
 DEV_START, DEV_DAYS, DEV_SEED = "2024-01-01", 365, 42
@@ -77,16 +82,16 @@ LAG_HOURS = 24               # how far back persistence/smart-persistence look
 BASELINE_NAMES = ["model", "persistence", "smart_persistence", "physics"]
 
 
-def _physics_baseline(features: pd.DataFrame, config: dict) -> pd.Series:
+def _physics_baseline(features: pd.DataFrame, plant_config: dict) -> pd.Series:
     """No ML: forecast GHI -> power via the plant's rated conversion only."""
-    plant = config["solar_plant"]
-    power = (features["shortwave_radiation"] / 1000) * plant["performance_ratio"] * plant["capacity_mw"]
-    return power.clip(lower=0, upper=plant["capacity_mw"])
+    plant = plant_config["capacity"]
+    power = (features["shortwave_radiation"] / 1000) * plant["performance_ratio"] * plant["ac_capacity_mw"]
+    return power.clip(lower=0, upper=plant["ac_capacity_mw"])
 
 
-def _clear_sky_power(features: pd.DataFrame, config: dict) -> pd.Series:
-    plant = config["solar_plant"]
-    return (features["clear_sky_ghi_model"] / 1000) * plant["performance_ratio"] * plant["capacity_mw"]
+def _clear_sky_power(features: pd.DataFrame, plant_config: dict) -> pd.Series:
+    plant = plant_config["capacity"]
+    return (features["clear_sky_ghi_model"] / 1000) * plant["performance_ratio"] * plant["ac_capacity_mw"]
 
 
 def _persistence_baseline(y: pd.Series) -> pd.Series:
@@ -94,11 +99,11 @@ def _persistence_baseline(y: pd.Series) -> pd.Series:
     return y.shift(LAG_HOURS)
 
 
-def _smart_persistence_baseline(y: pd.Series, features: pd.DataFrame, config: dict) -> pd.Series:
+def _smart_persistence_baseline(y: pd.Series, features: pd.DataFrame, plant_config: dict) -> pd.Series:
     """Persist YESTERDAY's clear-sky ratio, applied to TODAY's clear-sky
     estimate. Uses only y(t-24h) and clear_sky_power(t-24h)/(t) -- nothing
     at or after t, so this is a legitimate forecast, not a leak."""
-    csp = _clear_sky_power(features, config)
+    csp = _clear_sky_power(features, plant_config)
     ratio_yesterday = (y / csp.replace(0, np.nan)).shift(LAG_HOURS)
     return (csp * ratio_yesterday).clip(lower=0)
 
@@ -125,17 +130,17 @@ def _fresh_model() -> XGBRegressor:
     )
 
 
-def rolling_origin_backtest(features: pd.DataFrame, config: dict) -> pd.DataFrame:
+def rolling_origin_backtest(features: pd.DataFrame, plant_config: dict) -> pd.DataFrame:
     """Walk forward through the development period: at each origin, train
     only on the past, score the next FORECAST_HORIZON_HOURS. Baselines are
     parameter-free, so they're just evaluated on the same test window."""
     y = features["solar_output_mw"]
-    capacity_mw = config["solar_plant"]["capacity_mw"]
+    capacity_mw = plant_config["capacity"]["ac_capacity_mw"]
     daytime = features["clear_sky_ghi_model"] > 1.0
 
     persistence = _persistence_baseline(y)
-    smart_persistence = _smart_persistence_baseline(y, features, config)
-    physics = _physics_baseline(features, config)
+    smart_persistence = _smart_persistence_baseline(y, features, plant_config)
+    physics = _physics_baseline(features, plant_config)
 
     origins = list(range(MIN_TRAIN_HOURS, len(features) - FORECAST_HORIZON_HOURS, ORIGIN_STRIDE_HOURS))
     assert len(origins) >= 8, f"only {len(origins)} origins -- widen the development period"
@@ -145,10 +150,13 @@ def rolling_origin_backtest(features: pd.DataFrame, config: dict) -> pd.DataFram
         train = slice(0, origin)
         test = slice(origin, origin + FORECAST_HORIZON_HOURS)
 
+        # Train on capacity FRACTION, matching src/models/train.py, so this
+        # internal diagnostic model reflects the same methodology as the
+        # actually-served model, not a different convention.
         model = _fresh_model()
-        model.fit(features[SERVING_FEATURE_COLUMNS].iloc[train], y.iloc[train])
+        model.fit(features[SERVING_FEATURE_COLUMNS].iloc[train], y.iloc[train] / capacity_mw)
         model_preds = pd.Series(
-            np.clip(model.predict(features[SERVING_FEATURE_COLUMNS].iloc[test]), 0, capacity_mw),
+            np.clip(model.predict(features[SERVING_FEATURE_COLUMNS].iloc[test]) * capacity_mw, 0, capacity_mw),
             index=y.iloc[test].index,
         )
 
@@ -172,7 +180,7 @@ def rolling_origin_backtest(features: pd.DataFrame, config: dict) -> pd.DataFram
     return results
 
 
-def final_holdout_eval(served_model, config: dict) -> dict:
+def final_holdout_eval(served_model, plant_config: dict) -> dict:
     """The one number that counts: the model actually being served, scored
     ONCE on a period it has never seen -- different date range, different
     random seed than train.py or any test file uses.
@@ -189,24 +197,26 @@ def final_holdout_eval(served_model, config: dict) -> dict:
         one would be misleading.
     """
     raw = generate_jaipur_weather(start_date=HOLDOUT_START, days=HOLDOUT_DAYS, seed=HOLDOUT_SEED)
-    capacity_mw = config["solar_plant"]["capacity_mw"]
+    capacity_mw = plant_config["capacity"]["ac_capacity_mw"]
 
-    observed_features = build_features(raw, config)
-    forecast_features = build_features(simulate_day_ahead_forecast(raw, seed=HOLDOUT_SEED + 1), config)
+    observed_features = build_features(raw, plant_config)
+    forecast_features = build_features(simulate_day_ahead_forecast(raw, seed=HOLDOUT_SEED + 1), plant_config)
     # y and the daylight mask come from the true data in both cases -- only
     # the WEATHER INPUT fed to the model differs between the two scorings.
     y = observed_features["solar_output_mw"]
     daytime = observed_features["clear_sky_ghi_model"] > 1.0
 
     persistence = _persistence_baseline(y)
-    smart_persistence = _smart_persistence_baseline(y, observed_features, config)
-    physics = _physics_baseline(observed_features, config)
+    smart_persistence = _smart_persistence_baseline(y, observed_features, plant_config)
+    physics = _physics_baseline(observed_features, plant_config)
 
     scores = {}
     for label, features in [("MODEL SKILL (observed weather)", observed_features),
                              ("DELIVERABLE SKILL (D-1 09:00 forecast weather, synthetic)", forecast_features)]:
+        # served_model outputs capacity FRACTION (0-1), not MW -- rescale
+        # by this plant's capacity (see src/models/train.py).
         model_preds = pd.Series(
-            np.clip(served_model.predict(features[SERVING_FEATURE_COLUMNS]), 0, capacity_mw),
+            np.clip(served_model.predict(features[SERVING_FEATURE_COLUMNS]) * capacity_mw, 0, capacity_mw),
             index=features.index,
         )
         print(f"\nFINAL HOLDOUT -- {label}")
@@ -236,8 +246,98 @@ def final_holdout_eval(served_model, config: dict) -> dict:
     return scores
 
 
+def _pinball_loss(y_true: np.ndarray, y_pred: np.ndarray, tau: float) -> float:
+    diff = y_true - y_pred
+    return float(np.mean(np.maximum(tau * diff, (tau - 1) * diff)))
+
+
+def quantile_final_holdout_eval(served_quantile_model, plant_config: dict) -> dict:
+    """Roadmap P1.3 acceptance criterion: pinball loss and a reliability
+    check (does P90 actually cover ~90% of observed blocks?), on the SAME
+    final-holdout period and SAME model-skill/deliverable-skill split as
+    final_holdout_eval above -- scored once, never touched by training.
+
+    Reliability is checked two ways, both against the daytime-only mask
+    used everywhere else in this file (nighttime output is trivially ~0
+    for every quantile, which would flatter coverage without meaning
+    anything):
+      - coverage_p90: fraction of true values <= the P90 prediction.
+        Should be close to 90% -- much lower means P90 is too tight
+        (understates risk of a high-output block); much higher means it's
+        too loose (uselessly wide).
+      - coverage_p10: fraction of true values >= the P10 prediction.
+        Should be close to 10%... i.e. fraction >= P10 close to 90%? No --
+        by definition P10 should be exceeded by ~90% of true values, so
+        we report fraction(y >= p10) and expect it near 90%, symmetric
+        with P90's near-90% framing.
+      - interval_80_coverage: fraction inside [P10, P90], expected ~80%.
+    """
+    raw = generate_jaipur_weather(start_date=HOLDOUT_START, days=HOLDOUT_DAYS, seed=HOLDOUT_SEED)
+    capacity_mw = plant_config["capacity"]["ac_capacity_mw"]
+
+    observed_features = build_features(raw, plant_config)
+    forecast_features = build_features(simulate_day_ahead_forecast(raw, seed=HOLDOUT_SEED + 1), plant_config)
+    y = observed_features["solar_output_mw"]
+    daytime = (observed_features["clear_sky_ghi_model"] > 1.0).to_numpy()
+
+    results = {}
+    for label, features in [("MODEL SKILL (observed weather)", observed_features),
+                             ("DELIVERABLE SKILL (D-1 09:00 forecast weather, synthetic)", forecast_features)]:
+        # Quantile model outputs capacity FRACTION, three columns [P10,P50,P90]
+        # (see src/models/train.py) -- rescale, then sort defensively so a
+        # rare crossing never produces a nonsensical P10 > P90 interval.
+        raw_preds = np.clip(served_quantile_model.predict(features[SERVING_FEATURE_COLUMNS]) * capacity_mw,
+                             0, capacity_mw)
+        preds = np.sort(raw_preds, axis=1)
+        p10, p50, p90 = preds[:, 0], preds[:, 1], preds[:, 2]
+
+        y_arr = y.to_numpy()
+        mask = daytime & ~np.isnan(y_arr)
+        y_m, p10_m, p50_m, p90_m = y_arr[mask], p10[mask], p50[mask], p90[mask]
+
+        pinball = {
+            str(tau): 100 * _pinball_loss(y_m, pred, tau) / capacity_mw
+            for tau, pred in zip(QUANTILE_LEVELS, [p10_m, p50_m, p90_m])
+        }
+        coverage_p90 = float(np.mean(y_m <= p90_m))
+        coverage_p10 = float(np.mean(y_m >= p10_m))
+        interval_80_coverage = float(np.mean((y_m >= p10_m) & (y_m <= p90_m)))
+        non_crossing = bool(np.all(preds[:, 0] <= preds[:, 1] + 1e-6) and np.all(preds[:, 1] <= preds[:, 2] + 1e-6))
+
+        print(f"\nQUANTILE FINAL HOLDOUT -- {label}")
+        print(f"({HOLDOUT_START} + {HOLDOUT_DAYS}d, seed={HOLDOUT_SEED}, n={mask.sum()} daytime blocks)\n")
+        print(f"  Pinball loss (% of capacity): P10={pinball['0.1']:.3f}  P50={pinball['0.5']:.3f}  P90={pinball['0.9']:.3f}")
+        print(f"  Reliability: P(y<=P90)={coverage_p90:.1%} (target ~90%)   "
+              f"P(y>=P10)={coverage_p10:.1%} (target ~90%)   "
+              f"P(P10<=y<=P90)={interval_80_coverage:.1%} (target ~80%)")
+        print(f"  Non-crossing (P10<=P50<=P90) holds for all rows: {non_crossing}")
+
+        results[label] = {
+            "pinball_loss_pct_capacity": {k: round(v, 4) for k, v in pinball.items()},
+            "coverage_p90": round(coverage_p90, 4),
+            "coverage_p10": round(coverage_p10, 4),
+            "interval_80_coverage": round(interval_80_coverage, 4),
+            "non_crossing_holds": non_crossing,
+        }
+
+    deliverable = results["DELIVERABLE SKILL (D-1 09:00 forecast weather, synthetic)"]
+    cov90, cov10, cov80 = (deliverable["coverage_p90"], deliverable["coverage_p10"],
+                            deliverable["interval_80_coverage"])
+    # A loose, honest tolerance band (+-10 points) -- this is a calibration
+    # check on a single 30-day holdout, not a guarantee to the decimal.
+    if 0.80 <= cov90 <= 0.98 and 0.80 <= cov10 <= 0.98 and 0.65 <= cov80 <= 0.92:
+        print(f"\nPASS -- P10/P50/P90 are reasonably well-calibrated on the deliverable-skill holdout "
+              f"(P90 coverage {cov90:.1%}, P10 coverage {cov10:.1%}, 80% interval coverage {cov80:.1%}).")
+    else:
+        print(f"\nFAIL -- quantile calibration is off on the deliverable-skill holdout "
+              f"(P90 coverage {cov90:.1%}, P10 coverage {cov10:.1%}, 80% interval coverage {cov80:.1%}) "
+              f"-- outside the expected ~80-98% / ~80-98% / ~65-92% bands. Investigate before trusting "
+              f"these intervals.")
+    return results
+
+
 def main():
-    config = get_config()
+    plant_config = get_plant_config(BENCHMARK_PLANT_ID)
 
     if not MODEL_PATH.exists():
         raise SystemExit(f"No served model at {MODEL_PATH} -- run `make train` first.")
@@ -250,10 +350,19 @@ def main():
     # retrains at each origin should reflect the same real-world condition,
     # not the simulator's perfect weather.
     dev_forecast_quality = simulate_day_ahead_forecast(dev_raw, seed=DEV_FORECAST_NOISE_SEED)
-    dev_features = build_features(dev_forecast_quality, config)
+    dev_features = build_features(dev_forecast_quality, plant_config)
 
-    rolling_results = rolling_origin_backtest(dev_features, config)
-    holdout_scores = final_holdout_eval(served_model, config)
+    rolling_results = rolling_origin_backtest(dev_features, plant_config)
+    holdout_scores = final_holdout_eval(served_model, plant_config)
+
+    quantile_holdout_results = None
+    if QUANTILE_MODEL_PATH.exists():
+        served_quantile_model = XGBRegressor()
+        served_quantile_model.load_model(str(QUANTILE_MODEL_PATH))
+        quantile_holdout_results = quantile_final_holdout_eval(served_quantile_model, plant_config)
+    else:
+        print(f"\nNo quantile model at {QUANTILE_MODEL_PATH} -- skipping P1.3 pinball/reliability eval "
+              f"(run `make train` first).")
 
     observed_label = "MODEL SKILL (observed weather)"
     forecast_label = "DELIVERABLE SKILL (D-1 09:00 forecast weather, synthetic)"
@@ -278,6 +387,13 @@ def main():
                 name: round(float(scores[forecast_label]), 3) for name, scores in holdout_scores.items()
             },
         },
+        **({"quantile_final_holdout": {
+            "period": {"start": HOLDOUT_START, "days": HOLDOUT_DAYS, "seed": HOLDOUT_SEED},
+            "quantile_levels": QUANTILE_LEVELS,
+            "model_skill": quantile_holdout_results["MODEL SKILL (observed weather)"],
+            "deliverable_skill": quantile_holdout_results[
+                "DELIVERABLE SKILL (D-1 09:00 forecast weather, synthetic)"],
+        }} if quantile_holdout_results is not None else {}),
     )
     print("\nUpdated src/models/model_card.json with the benchmark results above.")
 

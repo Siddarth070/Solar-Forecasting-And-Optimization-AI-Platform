@@ -47,6 +47,7 @@ plotly==7.1.0
 pytest==9.1.1
 pytest-cov==7.1.0
 httpx==0.28.1            # Required by fastapi.testclient.TestClient
+scipy==1.17.1            # norm.ppf in tests/test_probabilistic_forecast.py's closed-form ground truth
 
 # ── Development utilities ────────────────────────────────────
 jupyter==1.1.1

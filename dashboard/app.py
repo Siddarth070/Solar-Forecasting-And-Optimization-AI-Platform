@@ -14,7 +14,7 @@ import plotly.graph_objects as go
 import requests
 import sys
 from pathlib import Path
-from datetime import datetime
+from datetime import datetime, date
 from xgboost import XGBRegressor
 
 # ── Path setup ────────────────────────────────────────────────
@@ -23,9 +23,8 @@ sys.path.insert(0, str(PROJECT_ROOT))
 sys.path.insert(0, str(PROJECT_ROOT.parent))
 
 from src.features.pipeline import build_features, SERVING_FEATURE_COLUMNS
-from src.utils.config_loader import get_config
-
-CONFIG = get_config()
+from src.utils.config_loader import get_plant_config, list_plant_ids
+from src.regulatory import dsm as _dsm
 
 # ── Page config ───────────────────────────────────────────────
 st.set_page_config(
@@ -33,6 +32,17 @@ st.set_page_config(
     page_icon="🌤️",
     layout="wide"
 )
+
+# ── Plant selection (roadmap P1.1 — no hardcoded single location) ──
+plant_ids = list_plant_ids()
+with st.sidebar:
+    st.header("🏭 Plant")
+    selected_plant_id = st.selectbox(
+        "Select plant", plant_ids,
+        format_func=lambda pid: get_plant_config(pid)["name"],
+    )
+PLANT = get_plant_config(selected_plant_id)
+PLANT_CAPACITY_MW = PLANT["capacity"]["ac_capacity_mw"]
 
 # ── Load model ────────────────────────────────────────────────
 @st.cache_resource
@@ -60,18 +70,41 @@ def load_model():
 
 model, model_loaded = load_model()
 
+@st.cache_resource
+def load_quantile_model():
+    """Load the P10/P50/P90 quantile model (roadmap P1.3). Optional -- the
+    point forecast above works without it; its absence just means no
+    uncertainty band is shown."""
+    possible_paths = [
+        Path(__file__).resolve().parent / "src" / "models" / "xgboost_solar_quantile.json",
+        Path("/app/src/models/xgboost_solar_quantile.json"),
+        Path("src/models/xgboost_solar_quantile.json"),
+        Path(__file__).resolve().parent.parent / "src" / "models" / "xgboost_solar_quantile.json",
+    ]
+    for path in possible_paths:
+        if path.exists():
+            try:
+                qmodel = XGBRegressor()
+                qmodel.load_model(str(path))
+                return qmodel, True
+            except Exception:
+                continue
+    return None, False
+
+quantile_model, quantile_model_loaded = load_quantile_model()
+
 # ── Weather fetcher ───────────────────────────────────────────
-@st.cache_data(ttl=3600)  # cache for 1 hour
-def get_live_weather():
+@st.cache_data(ttl=3600)  # cache for 1 hour, per (latitude, longitude)
+def get_live_weather(latitude: float, longitude: float):
     """
-    Fetch real live weather from Open-Meteo for Jaipur.
+    Fetch real live weather from Open-Meteo for the given coordinates.
     Cached for 1 hour — refreshes automatically.
     """
     try:
         url = "https://api.open-meteo.com/v1/forecast"
         params = {
-            "latitude"      : 26.9124,
-            "longitude"     : 75.7873,
+            "latitude"      : latitude,
+            "longitude"     : longitude,
             "hourly"        : [
                 "temperature_2m",
                 "relative_humidity_2m",
@@ -120,44 +153,75 @@ def get_live_weather():
         return records, False
 
 # ── Forecast function ─────────────────────────────────────────
-def run_forecast(weather_data):
+def run_forecast(weather_data, plant_config, capacity_mw):
     """Run XGBoost model on weather data via the canonical feature pipeline
     (src/features/pipeline.py) — no more hand-built, drifting feature dict."""
     if model is None:
         return None
 
     # build_features needs a real timestamp (for the solar-position
-    # clear-sky estimate); weather_data only carries hour + month, so we
-    # anchor to a fixed reference year/day, same approach as the API
-    # (src/api/main.py) — an approximation pending a proper per-timestamp
-    # request shape (P1.2).
+    # clear-sky estimate, using THIS plant's lat/lon); weather_data only
+    # carries hour + month, so we anchor to a fixed reference year/day,
+    # same approach as the API (src/api/main.py) — an approximation
+    # pending a proper per-timestamp request shape (P1.2).
     timestamps = pd.DatetimeIndex([
         pd.Timestamp(year=2024, month=h["month"], day=15, hour=h["hour"],
                      tz="Asia/Kolkata")
         for h in weather_data
     ])
     raw = pd.DataFrame(weather_data, index=timestamps)
-    features = build_features(raw, CONFIG)
+    features = build_features(raw, plant_config)
     X = features[SERVING_FEATURE_COLUMNS]
 
-    predictions = model.predict(X)
-    return np.clip(predictions, 0, 100).tolist()
+    # Model outputs capacity FRACTION (0-1), not MW (see
+    # src/models/train.py) -- rescale by THIS plant's own capacity so one
+    # model correctly serves differently-sized plants.
+    predictions = model.predict(X) * capacity_mw
+    return np.clip(predictions, 0, capacity_mw).tolist()
+
+# ── Probabilistic forecast (P10/P50/P90) ─────────────────────────
+def run_quantile_forecast(weather_data, plant_config, capacity_mw):
+    """Same feature pipeline as run_forecast, but through the quantile
+    model (roadmap P1.3). Returns None if the quantile model isn't
+    available -- callers must handle that gracefully, not crash."""
+    if quantile_model is None:
+        return None
+
+    timestamps = pd.DatetimeIndex([
+        pd.Timestamp(year=2024, month=h["month"], day=15, hour=h["hour"],
+                     tz="Asia/Kolkata")
+        for h in weather_data
+    ])
+    raw = pd.DataFrame(weather_data, index=timestamps)
+    features = build_features(raw, plant_config)
+    X = features[SERVING_FEATURE_COLUMNS]
+
+    # Three columns [P10, P50, P90], capacity fraction -- rescale, then
+    # sort defensively so a rare crossing never yields P10 > P90.
+    q_preds = np.clip(quantile_model.predict(X) * capacity_mw, 0, capacity_mw)
+    q_preds = np.sort(q_preds, axis=1)
+    return q_preds[:, 0].tolist(), q_preds[:, 1].tolist(), q_preds[:, 2].tolist()
 
 # ── Battery optimizer ─────────────────────────────────────────
-def run_optimization(solar_forecast, demand_forecast,
+def run_optimization(solar_forecast, declared_schedule_mw,
                      battery_capacity=50, charge_rate=25,
                      discharge_rate=25, initial_charge=25):
     """
     Simple rule-based battery optimizer.
     No PuLP needed — works on Streamlit Cloud.
+
+    declared_schedule_mw: what the plant committed to deliver to the grid
+    each hour — a real IPP has a schedule, not a "demand" curve to guess
+    at (roadmap P1.6). Set by the operator (see the sidebar), never
+    fabricated by this function.
     """
     results = []
     battery = initial_charge
 
     for t in range(len(solar_forecast)):
         solar   = solar_forecast[t]
-        demand  = demand_forecast[t]
-        surplus = solar - demand
+        schedule = declared_schedule_mw[t]
+        surplus = solar - schedule
 
         charge_amt    = 0.0
         discharge_amt = 0.0
@@ -175,15 +239,15 @@ def run_optimization(solar_forecast, demand_forecast,
             action = "HOLD"
 
         results.append({
-            'hour'               : t,
-            'solar_mw'           : round(solar, 2),
-            'demand_mw'          : round(demand, 2),
-            'surplus_mw'         : round(surplus, 2),
-            'charge_mw'          : round(charge_amt, 2),
-            'discharge_mw'       : round(discharge_amt, 2),
-            'battery_level_mwh'  : round(battery, 2),
-            'grid_balance_mw'    : round(solar + discharge_amt - charge_amt - demand, 2),
-            'action'             : action
+            'hour'                    : t,
+            'solar_mw'                : round(solar, 2),
+            'declared_schedule_mw'    : round(schedule, 2),
+            'surplus_mw'              : round(surplus, 2),
+            'charge_mw'               : round(charge_amt, 2),
+            'discharge_mw'            : round(discharge_amt, 2),
+            'battery_level_mwh'       : round(battery, 2),
+            'grid_balance_mw'         : round(solar + discharge_amt - charge_amt - schedule, 2),
+            'action'                  : action
         })
 
     return pd.DataFrame(results)
@@ -194,7 +258,10 @@ def run_optimization(solar_forecast, demand_forecast,
 
 # Header
 st.title("⚡ Zenith")
-st.caption("Peak solar intelligence for India's grid — Jaipur, Rajasthan")
+st.caption(
+    f"Peak solar intelligence for India's grid — "
+    f"{PLANT['location']['name']}, {PLANT['location']['state']}"
+)
 
 # Model status
 if model_loaded:
@@ -204,12 +271,14 @@ else:
     st.stop()
 
 # Fetch weather
-weather_data, is_live = get_live_weather()
+weather_data, is_live = get_live_weather(
+    PLANT["location"]["latitude"], PLANT["location"]["longitude"]
+)
 
 # Live/demo indicator
 if is_live:
     st.success(
-        f"🌤️ Live weather — Jaipur, Rajasthan | "
+        f"🌤️ Live weather — {PLANT['location']['name']}, {PLANT['location']['state']} | "
         f"Updated: {datetime.now().strftime('%d %b %Y, %I:%M %p IST')}"
     )
 else:
@@ -218,7 +287,7 @@ else:
 st.divider()
 
 # ── Run forecast ──────────────────────────────────────────────
-predictions = run_forecast(weather_data)
+predictions = run_forecast(weather_data, PLANT, PLANT_CAPACITY_MW)
 
 if predictions is None:
     st.error("Forecast failed — model not loaded")
@@ -236,29 +305,56 @@ col1, col2, col3, col4 = st.columns(4)
 col1.metric("Expected Generation", f"{total_gen} MWh")
 col2.metric("Peak Output",         f"{peak_mw} MW")
 col3.metric("Peak Hour",           f"{peak_hour:02d}:00")
-col4.metric("Plant Capacity",      "100 MW")
+col4.metric("Plant Capacity",      f"{PLANT_CAPACITY_MW:.0f} MW")
 
 st.divider()
 
 # ── Forecast chart ────────────────────────────────────────────
 st.subheader("24-Hour Solar Generation Forecast")
 
-demand = [
-    round(40 + 8 * np.sin(np.pi * (h - 6) / 12), 2)
-    for h in hours
-]
+# Declared schedule: what THIS plant committed to deliver to the grid --
+# not a "demand" curve. A solar IPP doesn't have demand, it has a schedule
+# (roadmap P1.6). Previously this was a hardcoded 40 + 8*sin(...) formula
+# fabricated with no relationship to any real plant; there is no synthetic
+# demand anywhere in this dashboard now -- the operator sets their own
+# number below.
+with st.sidebar:
+    st.header("📋 Declared Schedule")
+    declared_schedule_mw = st.slider(
+        "Flat declared schedule (MW)", 0, int(PLANT_CAPACITY_MW),
+        int(PLANT_CAPACITY_MW * 0.4),
+        help="What this plant committed to deliver to the grid for every "
+             "hour today. A single flat value for now — per-hour schedules "
+             "are roadmap P1.5/P2.7."
+    )
+declared_schedule = [declared_schedule_mw] * len(hours)
+
+quantiles = run_quantile_forecast(weather_data, PLANT, PLANT_CAPACITY_MW)
 
 fig1 = go.Figure()
+if quantiles is not None:
+    p10, p50, p90 = quantiles
+    # P10-P90 band drawn first (roadmap P1.3): P90 as the visible boundary,
+    # then P10 filled back down to it -- the standard two-trace band trick,
+    # since Plotly only fills between consecutive traces.
+    fig1.add_trace(go.Scatter(
+        x=hours, y=p90, name='P90', mode='lines',
+        line=dict(width=0), showlegend=False, hoverinfo='skip',
+    ))
+    fig1.add_trace(go.Scatter(
+        x=hours, y=p10, name='P10-P90 range', mode='lines',
+        line=dict(width=0), fill='tonexty', fillcolor='rgba(255,165,0,0.15)',
+    ))
 fig1.add_trace(go.Scatter(
     x=hours, y=predictions,
     name='Solar forecast',
     line=dict(color='orange', width=2),
-    fill='tozeroy',
-    fillcolor='rgba(255,165,0,0.15)'
+    fill='tozeroy' if quantiles is None else None,
+    fillcolor='rgba(255,165,0,0.15)' if quantiles is None else None,
 ))
 fig1.add_trace(go.Scatter(
-    x=hours, y=demand,
-    name='Demand forecast',
+    x=hours, y=declared_schedule,
+    name='Declared schedule',
     line=dict(color='royalblue', width=2, dash='dash')
 ))
 fig1.update_layout(
@@ -284,19 +380,50 @@ with st.sidebar:
     initial_charge   = st.slider("Initial charge (MWh)",   0,  50,  25)
 
 schedule = run_optimization(
-    predictions, demand,
+    predictions, declared_schedule,
     battery_capacity, charge_rate,
     discharge_rate, initial_charge
 )
 
+# DSM cost estimate (roadmap P1.7): this heuristic dispatch (above) is NOT
+# solving for DSM cost -- only src/optimization/battery_optimizer.py's real
+# LP does that (served via the API's /optimize?plant_id=... option). This
+# reports what the REAL CERC Regulation 8(4) structure would charge for
+# the heuristic's OWN dispatch decisions, using src/regulatory/dsm.py --
+# the same tested module, not a re-derived copy. dt_hours=1.0 here matches
+# this dashboard's existing hourly (not 15-minute block) resolution.
+regulatory_cfg = PLANT.get("regulatory") or {}
+plant_contract_rate = regulatory_cfg.get("contract_rate_rs_per_kwh")
+dsm_total_rs = None
+if plant_contract_rate is not None:
+    available_capacity_mwh = PLANT_CAPACITY_MW * 1.0  # 1-hour blocks
+    seller_category = regulatory_cfg.get("seller_category", "solar")
+    grid_delivered = schedule["solar_mw"] + schedule["discharge_mw"] - schedule["charge_mw"]
+    signed_deviation_mwh = (grid_delivered - schedule["declared_schedule_mw"]) * 1.0
+    dsm_total_rs = sum(
+        _dsm.deviation_settlement(d, available_capacity_mwh, plant_contract_rate,
+                                   seller_category, date.today())["net_rs"]
+        for d in signed_deviation_mwh
+    )
+
 # Summary metrics
-c1, c2, c3 = st.columns(3)
-c1.metric("Total Charged",
-          f"{schedule['charge_mw'].sum():.1f} MWh")
-c2.metric("Total Discharged",
-          f"{schedule['discharge_mw'].sum():.1f} MWh")
-c3.metric("Hours Active",
-          f"{(schedule['action'] != 'HOLD').sum()}h")
+cols = st.columns(4 if dsm_total_rs is not None else 3)
+cols[0].metric("Total Charged",
+                f"{schedule['charge_mw'].sum():.1f} MWh")
+cols[1].metric("Total Discharged",
+                f"{schedule['discharge_mw'].sum():.1f} MWh")
+cols[2].metric("Hours Active",
+                f"{(schedule['action'] != 'HOLD').sum()}h")
+if dsm_total_rs is not None:
+    cols[3].metric(
+        "Est. DSM Exposure",
+        f"₹{dsm_total_rs:,.0f}",
+        help="Estimated CERC Regulation 8(4) deviation settlement for "
+             "today's dispatch (roadmap P1.7) -- negative means net "
+             "receivable. Uses this plant's configured contract rate, "
+             "which is an illustrative placeholder for this simulated "
+             "plant (see configs/plants/*.yaml)."
+    )
 
 # Battery level chart
 fig2 = go.Figure()

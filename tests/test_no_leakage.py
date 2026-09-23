@@ -32,7 +32,7 @@ PROJECT_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(PROJECT_ROOT))
 
 from src.features.pipeline import build_features, FEATURE_COLUMNS
-from src.utils.config_loader import get_config
+from src.utils.config_loader import get_plant_config
 
 
 def _sample_frame(n_hours: int = 200) -> pd.DataFrame:
@@ -65,17 +65,17 @@ class TestNoLeakage:
     """No feature may read solar_output_mw at or after its own timestamp."""
 
     def test_perturbing_target_at_t0_does_not_change_features_at_or_before_t0(self):
-        config = get_config()
+        plant_config = get_plant_config("jaipur_100mw")
         df = _sample_frame()
         t0 = 100
 
-        baseline = build_features(df, config)
+        baseline = build_features(df, plant_config)
 
         perturbed_df = df.copy()
         perturbed_df.iloc[
             t0, perturbed_df.columns.get_loc("solar_output_mw")
         ] += 1.0
-        perturbed = build_features(perturbed_df, config)
+        perturbed = build_features(perturbed_df, plant_config)
 
         for col in FEATURE_COLUMNS:
             assert col in baseline.columns, f"missing feature column: {col}"
@@ -90,17 +90,17 @@ class TestNoLeakage:
         """Sanity check on the test above: autoregressive features SHOULD
         change for rows after t0, proving the equality above isn't trivially
         true because build_features ignores solar_output_mw altogether."""
-        config = get_config()
+        plant_config = get_plant_config("jaipur_100mw")
         df = _sample_frame()
         t0 = 100
 
-        baseline = build_features(df, config)
+        baseline = build_features(df, plant_config)
 
         perturbed_df = df.copy()
         perturbed_df.iloc[
             t0, perturbed_df.columns.get_loc("solar_output_mw")
         ] += 50.0
-        perturbed = build_features(perturbed_df, config)
+        perturbed = build_features(perturbed_df, plant_config)
 
         # solar_lag_1h at t0+1 reads solar_output_mw[t0] — it must move.
         assert not np.isclose(
@@ -112,12 +112,12 @@ class TestNoLeakage:
         """The clear-sky denominator must depend only on time and location
         — identical whether or not solar_output_mw is present at all, as
         it would be absent for a genuine future forecast row."""
-        config = get_config()
+        plant_config = get_plant_config("jaipur_100mw")
         df = _sample_frame()
         df_no_target = df.drop(columns=["solar_output_mw"])
 
-        with_target = build_features(df, config)
-        without_target = build_features(df_no_target, config)
+        with_target = build_features(df, plant_config)
+        without_target = build_features(df_no_target, plant_config)
 
         pd.testing.assert_series_equal(
             with_target["clear_sky_index"],

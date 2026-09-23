@@ -85,10 +85,10 @@ def clear_sky_ghi(index: pd.DatetimeIndex, latitude: float, longitude: float,
     return location.get_clearsky(index, model="ineichen")["ghi"]
 
 
-def build_features(df: pd.DataFrame, config: dict) -> pd.DataFrame:
+def build_features(df: pd.DataFrame, plant_config: dict) -> pd.DataFrame:
     """
     Build the model's full feature set from a raw weather (+ optional
-    generation) frame.
+    generation) frame, for one specific plant.
 
     Parameters
     ----------
@@ -98,18 +98,21 @@ def build_features(df: pd.DataFrame, config: dict) -> pd.DataFrame:
         `relative_humidity_2m`, `wind_speed_10m`. May optionally contain
         `solar_output_mw` (only present for historical/training rows —
         a genuine forecast row has no generation value yet).
-    config : dict
-        Loaded app config (see `src.utils.config_loader.get_config`).
-        Reads `config["location"]["latitude"/"longitude"/"elevation_m"]`.
+    plant_config : dict
+        One plant's config (see
+        `src.utils.config_loader.get_plant_config`), NOT the global app
+        config — every plant has its own location, so this must be
+        plant-specific (roadmap P1.1: no module reads a global location).
+        Reads `plant_config["location"]["latitude"/"longitude"/"elevation_m"]`.
 
     Returns
     -------
     pd.DataFrame
         `df` plus every engineered feature column.
     """
-    latitude = config["location"]["latitude"]
-    longitude = config["location"]["longitude"]
-    altitude = config["location"].get("elevation_m", 0.0)
+    latitude = plant_config["location"]["latitude"]
+    longitude = plant_config["location"]["longitude"]
+    altitude = plant_config["location"].get("elevation_m", 0.0)
 
     out = df.copy()
 

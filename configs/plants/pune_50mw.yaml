@@ -1,0 +1,56 @@
+# ============================================================
+# Plant configuration — pune_50mw
+# ============================================================
+# Loaded via src.utils.config_loader.get_plant_config("pune_50mw"). Exists
+# to prove roadmap P1.1's acceptance criterion: two plants in two different
+# states running side by side from the same binary (see
+# tests/test_multi_plant.py). Coordinates/state are real, verifiable public
+# facts; capacity/panel figures are illustrative placeholders, same as
+# jaipur_100mw's. There is no real Pune weather/generation data behind this
+# yet — training data is still Jaipur's synthetic simulator only (see
+# src/models/train.py's docstring for that limitation).
+
+plant_id: "pune_50mw"
+name: "Pune Solar Plant (simulated)"
+
+location:
+  name: "Pune"
+  state: "Maharashtra"
+  latitude: 18.5204
+  longitude: 73.8567
+  elevation_m: 560
+  timezone: "Asia/Kolkata"
+
+capacity:
+  ac_capacity_mw: 50
+  dc_capacity_mw: 50           # placeholder — DC oversizing not modeled yet
+  panel_efficiency: 0.20
+  temperature_coefficient: -0.004
+  performance_ratio: 0.80
+  panel_area_m2: 250000        # scaled from jaipur_100mw's 500,000 m^2 @ 100MW
+  tilt_deg: null
+  azimuth_deg: null
+
+# Grid connection identifiers — not yet configured (no real grid-connection
+# data for this simulated demo plant); DSM regulatory fields ARE configured
+# below (roadmap P1.7).
+grid:
+  sldc: null
+  rldc: null
+  ists_or_instate: null
+  qca_role: null
+  metering_point: null
+
+regulatory:
+  # See jaipur_100mw.yaml's comment and src/regulatory/dsm.py's module
+  # docstring for the full CERC citation and the one documented gap
+  # (post-01.04.2026 deviation-% blend weight X, not yet published).
+  dsm_ruleset_id: "CERC_DSM_2024_Reg8(4)"
+  seller_category: "solar"
+  contract_rate_rs_per_kwh: 2.50  # ILLUSTRATIVE PLACEHOLDER -- see jaipur_100mw.yaml
+  schedule_format: null
+  # See jaipur_100mw.yaml's comment and src/regulatory/grid_code.py's
+  # module docstring for the full CERC IEGC 2023 citation.
+  revision_windows:
+    grid_code_ruleset_id: "CERC_IEGC_2023_Reg49"
+    transaction_type: "bilateral"  # ASSUMED -- see jaipur_100mw.yaml

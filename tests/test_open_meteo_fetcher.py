@@ -28,7 +28,7 @@ PROJECT_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(PROJECT_ROOT))
 
 
-from src.utils.config_loader import get_config
+from src.utils.config_loader import get_config, get_plant_config, list_plant_ids
 
 
 class TestConfigLoader:
@@ -38,23 +38,35 @@ class TestConfigLoader:
         config = get_config()
         assert config is not None
 
-    def test_config_has_location(self):
-        config = get_config()
-        assert "location" in config
-        assert "latitude" in config["location"]
-        assert "longitude" in config["location"]
-
-    def test_jaipur_coordinates(self):
-        config = get_config()
-        loc = config["location"]
-        # Jaipur is roughly 26.9°N, 75.8°E
-        assert 26.5 < loc["latitude"] < 27.5
-        assert 75.0 < loc["longitude"] < 76.5
-
     def test_config_has_data_sources(self):
         config = get_config()
         assert "data_sources" in config
         assert "open_meteo" in config["data_sources"]
+
+
+class TestPlantConfigLoader:
+    """Test that per-plant config loads correctly (roadmap P1.1 — no
+    module reads a single global location)."""
+
+    def test_at_least_two_plants_configured(self):
+        # The whole point of P1.1: more than one plant must exist.
+        assert len(list_plant_ids()) >= 2
+
+    def test_jaipur_plant_has_location(self):
+        plant = get_plant_config("jaipur_100mw")
+        assert "latitude" in plant["location"]
+        assert "longitude" in plant["location"]
+
+    def test_jaipur_coordinates(self):
+        loc = get_plant_config("jaipur_100mw")["location"]
+        # Jaipur is roughly 26.9°N, 75.8°E
+        assert 26.5 < loc["latitude"] < 27.5
+        assert 75.0 < loc["longitude"] < 76.5
+
+    def test_unknown_plant_raises(self):
+        import pytest
+        with pytest.raises(FileNotFoundError):
+            get_plant_config("does_not_exist")
 
 
 class TestResponseParsing:
@@ -85,26 +97,26 @@ class TestResponseParsing:
 
     def test_parse_produces_dataframe(self):
         from src.ingestion.open_meteo_fetcher import OpenMeteoFetcher
-        fetcher = OpenMeteoFetcher()
+        fetcher = OpenMeteoFetcher(get_plant_config("jaipur_100mw"))
         df = fetcher._parse_response(self._mock_response())
         assert isinstance(df, pd.DataFrame)
 
     def test_parse_correct_row_count(self):
         from src.ingestion.open_meteo_fetcher import OpenMeteoFetcher
-        fetcher = OpenMeteoFetcher()
+        fetcher = OpenMeteoFetcher(get_plant_config("jaipur_100mw"))
         df = fetcher._parse_response(self._mock_response())
         assert len(df) == 3
 
     def test_index_is_datetime_with_timezone(self):
         from src.ingestion.open_meteo_fetcher import OpenMeteoFetcher
-        fetcher = OpenMeteoFetcher()
+        fetcher = OpenMeteoFetcher(get_plant_config("jaipur_100mw"))
         df = fetcher._parse_response(self._mock_response())
         assert isinstance(df.index, pd.DatetimeIndex)
         assert df.index.tz is not None  # Must have timezone — no naive timestamps
 
     def test_metadata_columns_added(self):
         from src.ingestion.open_meteo_fetcher import OpenMeteoFetcher
-        fetcher = OpenMeteoFetcher()
+        fetcher = OpenMeteoFetcher(get_plant_config("jaipur_100mw"))
         df = fetcher._parse_response(self._mock_response())
         assert "hour" in df.columns
         assert "day_of_week" in df.columns
@@ -113,7 +125,7 @@ class TestResponseParsing:
 
     def test_numeric_columns_are_float32(self):
         from src.ingestion.open_meteo_fetcher import OpenMeteoFetcher
-        fetcher = OpenMeteoFetcher()
+        fetcher = OpenMeteoFetcher(get_plant_config("jaipur_100mw"))
         df = fetcher._parse_response(self._mock_response())
         assert df["temperature_2m"].dtype == "float32"
         assert df["cloud_cover"].dtype == "float32"
@@ -124,7 +136,7 @@ class TestValidation:
 
     def test_validation_passes_on_good_data(self):
         from src.ingestion.open_meteo_fetcher import OpenMeteoFetcher
-        fetcher = OpenMeteoFetcher()
+        fetcher = OpenMeteoFetcher(get_plant_config("jaipur_100mw"))
         # Create 24 rows of clean data
         df = pd.DataFrame({
             "temperature_2m": [25.0] * 24,
@@ -136,7 +148,7 @@ class TestValidation:
     def test_validation_warns_on_too_few_rows(self, caplog):
         from src.ingestion.open_meteo_fetcher import OpenMeteoFetcher
         import logging
-        fetcher = OpenMeteoFetcher()
+        fetcher = OpenMeteoFetcher(get_plant_config("jaipur_100mw"))
         df = pd.DataFrame({"temperature_2m": [25.0] * 5})
         # Only 5 rows — should log a warning
         with caplog.at_level(logging.WARNING):

@@ -1,0 +1,70 @@
+# ============================================================
+# Plant configuration — jaipur_100mw
+# ============================================================
+# Loaded via src.utils.config_loader.get_plant_config("jaipur_100mw").
+# Fields under `grid` are left null: populating them (SLDC/RLDC/QCA role/
+# metering point identifiers) requires real plant-specific grid-connection
+# facts this simulated demo plant doesn't have. `regulatory` below IS now
+# populated for `seller_category` (a real, verifiable regulatory fact —
+# see src/regulatory/dsm.py) but `contract_rate_rs_per_kwh` remains an
+# illustrative placeholder (see the field's own comment) since a PPA
+# tariff is commercial, plant-specific data the CERC regulations
+# themselves don't specify (roadmap P1.7, Ground Rule 4).
+
+plant_id: "jaipur_100mw"
+name: "Jaipur Solar Plant (simulated)"
+
+location:
+  name: "Jaipur"
+  state: "Rajasthan"
+  latitude: 26.9124
+  longitude: 75.7873
+  elevation_m: 431
+  timezone: "Asia/Kolkata"
+  # Rajasthan has one of the highest solar irradiance levels in India —
+  # annual GHI ~5.5-6.0 kWh/m^2/day.
+
+capacity:
+  ac_capacity_mw: 100
+  dc_capacity_mw: 100          # placeholder — DC oversizing not modeled yet
+  panel_efficiency: 0.20       # 20% — modern monocrystalline panels
+  temperature_coefficient: -0.004  # -0.4%/°C above 25°C (typical)
+  performance_ratio: 0.80      # Real-world losses (wiring, dust, inverter)
+  panel_area_m2: 500000        # Panel area for 100 MW at 20% efficiency
+  tilt_deg: null               # not yet used by src/features/pipeline.py
+  azimuth_deg: null            # (flat-plate horizontal GHI model only)
+
+# Grid connection identifiers — not yet configured (no real grid-connection
+# data for this simulated demo plant); DSM regulatory fields ARE configured
+# below (roadmap P1.7).
+grid:
+  sldc: null
+  rldc: null
+  ists_or_instate: null
+  qca_role: null
+  metering_point: null
+
+regulatory:
+  # CERC (Deviation Settlement Mechanism and Related Matters) Regulations,
+  # 2024, Regulation 8(4) + Note-1 (as amended by the 1st/2nd Amendments,
+  # which don't touch this; the 3rd Amendment is an unfinished draft --
+  # see src/regulatory/dsm.py's module docstring for full citations and
+  # the one real gap it documents rather than fabricates).
+  dsm_ruleset_id: "CERC_DSM_2024_Reg8(4)"
+  seller_category: "solar"   # WS seller sub-category (solar/hybrid vs wind have different Note-1 bands)
+  contract_rate_rs_per_kwh: 2.50  # ILLUSTRATIVE PLACEHOLDER -- this plant is simulated, so there is
+                                  # no real PPA/auction tariff to cite (Regulation 3(1)(j) contract
+                                  # rate is commercial data, not something the DSM regs themselves set).
+                                  # Replace with the plant's actual contracted rate before using this
+                                  # for real settlement decisions.
+  schedule_format: null
+  # CERC Indian Electricity Grid Code (IEGC) 2023, Regulation 49(8)/49(4)
+  # (c) -- see src/regulatory/grid_code.py's module docstring for full
+  # citations, including the CERC order this timing is verified against.
+  revision_windows:
+    grid_code_ruleset_id: "CERC_IEGC_2023_Reg49"
+    transaction_type: "bilateral"  # ASSUMED -- a solar IPP with a PPA is typically bilateral, not
+                                    # collective (exchange-only); this is a real regulatory fork in
+                                    # the road (Reg 49(8): only "bilateral" may revise at all) but
+                                    # which side this specific simulated plant is on isn't a fact
+                                    # this codebase has -- replace if the real plant sells collectively.
