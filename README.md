@@ -201,8 +201,26 @@ any new feature work. As of this commit:
   `/schedule/revise` already used. **Not done:** a numeric revision-count
   cap for WS sellers specifically (none of the source documents specify
   one; see `grid_code.py`'s docstring).
-- **Not started:** real customer-file ingestion, loss attribution, and
-  any real-plant validation — Phase 2 onward.
+- **Phase 2, started:** a data-quality gate (`src/quality/gate.py`,
+  `POST /quality/check`) that runs before any forecast is shown — per
+  the roadmap's own framing, "the customer sees a quality report before
+  they see a forecast." It checks ingested generation readings for a
+  missing timezone, duplicate timestamps, timestamp gaps (nominal
+  resolution inferred as the mode of consecutive deltas, robust to a few
+  genuine gaps), negative power, above-rated-capacity readings, flatlines
+  (a non-zero value repeated for >= 4 consecutive blocks — a likely stuck
+  inverter, distinct from the normal run of identical zero readings every
+  night), and generation reported while the sun is below the horizon at
+  the plant's real location (`pvlib`'s clear-sky model, using each
+  plant's actual lat/lon from `configs/plants/`). Each check reports a
+  severity (error = unsafe to forecast on, warning = usable but noted),
+  a count, and the specific timestamps — never a bare pass/fail. Tested
+  with 14 unit tests (one engineered problem per test, checked not to
+  accidentally trip a second check) plus 5 end-to-end API tests.
+- **Not started:** real customer-file ingestion (P2.1), loss attribution
+  (P2.4), schedule-risk scoring (P2.5), operator recommendations (P2.6),
+  weekly performance reports (P2.9), and any real-plant validation —
+  rest of Phase 2 onward.
 
 ## Known Gaps
 
@@ -254,6 +272,16 @@ any new feature work. As of this commit:
 - Everything is trained and validated on simulated data for one plant in
   one location — no real-plant or multi-season (beyond a synthetic full
   year) validation exists yet.
+- The data-quality gate (`src/quality/gate.py`) cannot detect a
+  mislabeled timezone by inference (e.g. data secretly in UTC but claiming
+  to be IST) — that needs a real ground truth to compare against. Its
+  `night_time_non_zero` check catches the common ~5:30h UTC/IST offset
+  error as a side effect (real solar position at the claimed timestamp
+  would show the sun down while data reports generation), but a
+  wrongly-labeled timezone with a smaller offset would not necessarily
+  trip it. It has also only been exercised on synthetic data — no real
+  customer file, with real logger dropouts and re-export duplicates, has
+  been run through it yet.
 
 ---
 

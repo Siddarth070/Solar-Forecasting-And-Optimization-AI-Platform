@@ -14,6 +14,7 @@ sys.path.insert(0, str(PROJECT_ROOT))
 
 from src.features.pipeline import build_features, SERVING_FEATURE_COLUMNS
 from src.optimization.battery_optimizer import BatteryOptimizer
+from src.quality.gate import run_quality_checks
 from src.regulatory import grid_code
 from src.scheduling.rolling_horizon import apply_schedule_revision
 from src.time_blocks import BLOCKS_PER_DAY, block_boundaries
@@ -190,6 +191,19 @@ class ReviseScheduleResponse(BaseModel):
     locked_block_count: int = Field(
         description="How many of the 96 blocks stayed locked at their old value."
     )
+
+
+class GenerationReading(BaseModel):
+    """One raw generation reading to be quality-checked (roadmap P2.2)."""
+    timestamp: str = Field(..., description="ISO8601 timestamp, e.g. '2024-06-01T09:00:00+05:30'.")
+    power_mw: float = Field(..., description="Reported generation in MW -- not clamped or "
+                                              "validated here; that's exactly what this endpoint checks.")
+
+
+class QualityCheckRequest(BaseModel):
+    """Request body for the data-quality gate (roadmap P2.2)."""
+    plant_id: str = Field(default=DEFAULT_PLANT_ID)
+    readings: list[GenerationReading] = Field(..., min_length=1)
 
 
 # ── Endpoints ─────────────────────────────────────────────────
@@ -490,4 +504,32 @@ def gate_closures(timestamp: str, plant_id: str = DEFAULT_PLANT_ID):
         }
     except Exception as e:
         logger.error(f"Gate closure lookup error: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/quality/check")
+def quality_check(request: QualityCheckRequest):
+    """
+    Run the data-quality gate over a plant's raw generation readings
+    (roadmap P2.2) -- "the customer sees a quality report before they see
+    a forecast." Detects timestamp gaps, duplicates, a missing timezone,
+    negative power, values above the plant's AC capacity, flatlines
+    (stuck inverter), and night-time non-zero generation (meter/timezone
+    fault). See src/quality/gate.py for the exact rules and thresholds.
+    """
+    try:
+        plant_config = get_plant_config(request.plant_id)
+    except FileNotFoundError as e:
+        raise HTTPException(status_code=404, detail=str(e))
+
+    try:
+        timestamps = pd.DatetimeIndex([pd.Timestamp(r.timestamp) for r in request.readings])
+        df = pd.DataFrame(
+            {"solar_output_mw": [r.power_mw for r in request.readings]},
+            index=timestamps,
+        )
+        report = run_quality_checks(df, plant_config)
+        return report.to_dict()
+    except Exception as e:
+        logger.error(f"Quality check error: {e}")
         raise HTTPException(status_code=500, detail=str(e))
