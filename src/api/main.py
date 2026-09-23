@@ -17,6 +17,7 @@ from src.features.pipeline import build_features, SERVING_FEATURE_COLUMNS
 from src.optimization.battery_optimizer import BatteryOptimizer
 from src.quality.gate import run_quality_checks
 from src.regulatory import grid_code
+from src.risk.schedule_risk import score_schedule_risk
 from src.scheduling.rolling_horizon import apply_schedule_revision
 from src.time_blocks import BLOCKS_PER_DAY, block_boundaries
 from src.utils.config_loader import get_plant_config, list_plant_ids
@@ -223,6 +224,36 @@ class LossAttributionRequest(BaseModel):
     """Request body for the loss attribution engine (roadmap P2.4)."""
     plant_id: str = Field(default=DEFAULT_PLANT_ID)
     readings: list[LossReading] = Field(..., min_length=1)
+
+
+class ScheduleRiskRequest(BaseModel):
+    """Request body for the schedule-risk scoring endpoint (roadmap P2.5)."""
+    plant_id: str = Field(
+        default=DEFAULT_PLANT_ID,
+        description="Must have regulatory.seller_category and "
+                     "regulatory.contract_rate_rs_per_kwh configured -- unlike "
+                     "/optimize, this endpoint has no flat-penalty fallback, "
+                     "since a risk score without the real DSM settlement math "
+                     "behind it would not mean anything."
+    )
+    declared_schedule_mw: list[float] = Field(..., min_length=1)
+    p10_mw: list[float] = Field(..., min_length=1)
+    p50_mw: list[float] = Field(..., min_length=1)
+    p90_mw: list[float] = Field(..., min_length=1)
+    dt_hours: float = Field(default=0.25, description="Block duration in hours")
+    as_of: str | None = Field(
+        default=None,
+        description="Calendar date (YYYY-MM-DD) deciding which side of the CERC DSM "
+                     "01.04.2026 cutover applies (roadmap P1.7). Defaults to `date` if "
+                     "given, else today."
+    )
+    date: str | None = Field(
+        default=None,
+        description="Calendar date (YYYY-MM-DD) this schedule covers (roadmap P1.4). If "
+                     f"given, all four *_mw lists MUST have exactly {BLOCKS_PER_DAY} "
+                     "entries -- one per real 15-minute block of that date -- dt_hours is "
+                     "fixed at 0.25, and the response carries real block-start timestamps."
+    )
 
 
 # ── Endpoints ─────────────────────────────────────────────────
@@ -598,3 +629,61 @@ def losses_attribute(request: LossAttributionRequest):
     except Exception as e:
         logger.error(f"Loss attribution error: {e}")
         raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/schedule/risk")
+def schedule_risk(request: ScheduleRiskRequest):
+    """
+    Score each block's DSM exposure risk (roadmap P2.5) by running its
+    P10/P50/P90 forecast against the declared schedule through the real
+    CERC DSM settlement math (src/regulatory/dsm.py, roadmap P1.7) and
+    reporting which Note-1 volume-limit band each quantile reaches. See
+    src/risk/schedule_risk.py for exactly how risk levels are derived.
+
+    DISCLAIMER (present on every block and on the report itself): this is
+    an indicative estimate from configured assumptions and uploaded data,
+    not an official settlement statement.
+    """
+    lists = [request.declared_schedule_mw, request.p10_mw, request.p50_mw, request.p90_mw]
+
+    block_starts = None
+    if request.date is not None:
+        if any(len(l) != BLOCKS_PER_DAY for l in lists):
+            raise HTTPException(
+                status_code=422,
+                detail=f"date={request.date!r} given: declared_schedule_mw, p10_mw, p50_mw "
+                       f"and p90_mw must each have exactly {BLOCKS_PER_DAY} entries (one per "
+                       f"real 15-minute block of that date), got {[len(l) for l in lists]}."
+            )
+        block_starts = block_boundaries(request.date)[:-1]
+    elif len({len(l) for l in lists}) != 1:
+        raise HTTPException(
+            status_code=422,
+            detail="declared_schedule_mw, p10_mw, p50_mw and p90_mw must all have the same "
+                   f"length, got {[len(l) for l in lists]}."
+        )
+
+    try:
+        plant_config = get_plant_config(request.plant_id)
+    except FileNotFoundError as e:
+        raise HTTPException(status_code=404, detail=str(e))
+
+    as_of_str = request.as_of or request.date
+    as_of = pd.Timestamp(as_of_str).date() if as_of_str else datetime.now().date()
+    dt_hours = 0.25 if block_starts is not None else request.dt_hours
+
+    try:
+        report = score_schedule_risk(
+            declared_schedule_mw=request.declared_schedule_mw,
+            p10_mw=request.p10_mw,
+            p50_mw=request.p50_mw,
+            p90_mw=request.p90_mw,
+            dt_hours=dt_hours,
+            plant_config=plant_config,
+            as_of=as_of,
+            timestamps=block_starts,
+        )
+    except ValueError as e:
+        raise HTTPException(status_code=422, detail=str(e))
+
+    return report.to_dict()

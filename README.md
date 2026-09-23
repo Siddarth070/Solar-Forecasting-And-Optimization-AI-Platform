@@ -243,9 +243,31 @@ any new feature work. As of this commit:
   suspected/possible — the module's own docstring and every such block's
   evidence text say so explicitly, never claiming a confirmed asset or a
   confirmed grid order.
-- **Not started:** real customer-file ingestion (P2.1), schedule-risk
-  scoring (P2.5), operator recommendations (P2.6), weekly performance
-  reports (P2.9), and any real-plant validation — rest of Phase 2 onward.
+  A schedule-risk scorer (`src/risk/schedule_risk.py`, `POST
+  /schedule/risk`) that runs each block's P10/P50/P90 forecast through
+  the real CERC DSM settlement math (`src/regulatory/dsm.py`, roadmap
+  P1.7) against the declared schedule and reports which Note-1
+  volume-limit band each quantile's deviation reaches — reusing
+  `deviation_settlement()`'s own segment widths to determine the band
+  rather than re-deriving separate cutoffs, so the band can never
+  disagree with the Rs figure reported alongside it. A block's risk
+  level (low/medium/high) is driven by the WORST band any of the three
+  quantiles reaches, so a calm median with a wide, risky tail is still
+  flagged — not just the point forecast. Correctly reads the real
+  01.04.2026 DSM cutover date (`as_of`), tightening the bands
+  post-cutover exactly as Regulation 8(4) Note-1 specifies. Per the
+  roadmap, every block AND the report itself carry the disclaimer
+  verbatim: "Indicative DSM exposure based on configured assumptions and
+  uploaded data. Not an official settlement statement." Has no flat-
+  penalty fallback (unlike `/optimize`) — a plant missing
+  `regulatory.seller_category`/`contract_rate_rs_per_kwh` gets a clear
+  422, not a silent, meaningless estimate. Tested with 7 unit tests
+  (hand-computed deviation MWh and band per scenario, including a test
+  proving the same deviation reads a stricter band after the cutover
+  date) plus 7 end-to-end API tests.
+- **Not started:** real customer-file ingestion (P2.1), operator
+  recommendations (P2.6), weekly performance reports (P2.9), and any
+  real-plant validation — rest of Phase 2 onward.
 
 ## Known Gaps
 
@@ -319,6 +341,16 @@ any new feature work. As of this commit:
   counterparty). The soiling check needs 10+ real calendar days of
   readings to fit a trend on; it has only been exercised on synthetic
   multi-day scenarios, not a real degrading plant.
+- The schedule-risk scorer (`src/risk/schedule_risk.py`) inherits, not
+  duplicates, `src/regulatory/dsm.py`'s own two documented gaps: its Rs
+  figures use the illustrative `contract_rate_rs_per_kwh` placeholder
+  (not a real PPA tariff), and its post-01.04.2026 classification uses
+  the same explicitly-labeled Available-Capacity-only fallback for the
+  unpublished blend-weight "X". It also has no automatic upsampling from
+  `/forecast`'s hourly P10/P50/P90 output onto the 96-block grid this
+  endpoint expects (the same gap already noted for `/forecast` above) —
+  a caller must resample first, e.g. via `src.time_blocks.
+  integrate_to_blocks`.
 
 ---
 
