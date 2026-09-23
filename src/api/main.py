@@ -23,6 +23,7 @@ from src.recommendations.engine import (
     recommend_schedule_revisions,
 )
 from src.regulatory import grid_code
+from src.reporting.weekly_report import generate_weekly_report
 from src.risk.schedule_risk import score_schedule_risk
 from src.scheduling.rolling_horizon import apply_schedule_revision
 from src.time_blocks import BLOCKS_PER_DAY, block_boundaries
@@ -321,6 +322,36 @@ class RecommendationDecisionRequest(BaseModel):
     decision: str = Field(..., description="'approved' or 'dismissed'.")
     decided_by: str = Field(..., description="Who made this decision -- required for the audit log.")
     note: str = Field(default="")
+
+
+class WeeklyReportReading(BaseModel):
+    """One historical weather+actual reading (roadmap P2.9). Must cover
+    every `forecasts[].target_timestamp` AND at least
+    src.evaluation.baselines.LAG_HOURS (24h) before the earliest one --
+    persistence/smart_persistence need that lookback."""
+    timestamp: str = Field(..., description="ISO8601 timestamp, e.g. '2024-06-01T09:00:00+05:30'.")
+    shortwave_radiation: float = Field(..., ge=0, le=1200, description="GHI in W/m^2")
+    cloud_cover: float = Field(..., ge=0, le=100)
+    temperature_2m: float = Field(..., ge=-10, le=60)
+    relative_humidity_2m: float = Field(..., ge=0, le=100)
+    wind_speed_10m: float = Field(..., ge=0, le=50)
+    solar_output_mw: float = Field(..., description="Actual generation -- the now-known outcome.")
+
+
+class ServedForecastRecord(BaseModel):
+    """One forecast that was actually served, now scoreable against a
+    known outcome (roadmap P2.9)."""
+    target_timestamp: str = Field(..., description="Which timestamp this forecast was FOR.")
+    horizon_hours: int = Field(..., description="How far ahead the forecast was made, e.g. 1, 6, 24.")
+    predicted_mw: float
+
+
+class WeeklyReportRequest(BaseModel):
+    """Request body for the weekly forecast-performance report (roadmap
+    P2.9)."""
+    plant_id: str = Field(default=DEFAULT_PLANT_ID)
+    readings: list[WeeklyReportReading] = Field(..., min_length=1)
+    forecasts: list[ServedForecastRecord] = Field(..., min_length=1)
 
 
 # ── Endpoints ─────────────────────────────────────────────────
@@ -875,3 +906,51 @@ def recommendations_decide(recommendation_id: int, request: RecommendationDecisi
         raise HTTPException(status_code=404, detail=str(e))
     except ValueError as e:
         raise HTTPException(status_code=422, detail=str(e))
+
+
+@app.post("/reports/weekly")
+def reports_weekly(request: WeeklyReportRequest):
+    """
+    Score a batch of already-served forecasts against their now-known
+    actual outcomes (roadmap P2.9), broken down by lead time (horizon)
+    and time of day (block), against the same three untrained baselines
+    used in this project's own training-time evaluation
+    (src/evaluation/baselines.py, shared with benchmark.py so both use
+    identical math). Every number here is traced directly to the
+    `readings`/`forecasts` given -- nothing is estimated or assumed.
+    """
+    try:
+        plant_config = get_plant_config(request.plant_id)
+    except FileNotFoundError as e:
+        raise HTTPException(status_code=404, detail=str(e))
+
+    try:
+        timestamps = pd.DatetimeIndex([pd.Timestamp(r.timestamp) for r in request.readings])
+        raw = pd.DataFrame(
+            [{
+                "hour": ts.hour,
+                "month": ts.month,
+                "cloud_cover": r.cloud_cover,
+                "shortwave_radiation": r.shortwave_radiation,
+                "temperature_2m": r.temperature_2m,
+                "relative_humidity_2m": r.relative_humidity_2m,
+                "wind_speed_10m": r.wind_speed_10m,
+                "solar_output_mw": r.solar_output_mw,
+            } for r, ts in zip(request.readings, timestamps)],
+            index=timestamps,
+        )
+        features = build_features(raw, plant_config)
+
+        forecasts_df = pd.DataFrame([{
+            "target_timestamp": f.target_timestamp,
+            "horizon_hours": f.horizon_hours,
+            "predicted_mw": f.predicted_mw,
+        } for f in request.forecasts])
+
+        report = generate_weekly_report(forecasts_df, features, plant_config)
+        return report.to_dict()
+    except ValueError as e:
+        raise HTTPException(status_code=422, detail=str(e))
+    except Exception as e:
+        logger.error(f"Weekly report error: {e}")
+        raise HTTPException(status_code=500, detail=str(e))

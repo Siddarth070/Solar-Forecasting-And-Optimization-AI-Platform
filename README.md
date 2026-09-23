@@ -291,9 +291,30 @@ any new feature work. As of this commit:
   the three rules plus 10 for the log (including that a nonexistent
   recommendation, an unattributed decision, and an invalid decision
   value all fail loudly) plus 10 end-to-end API tests.
-- **Not started:** real customer-file ingestion (P2.1), weekly
-  performance reports (P2.9), and any real-plant validation — rest of
-  Phase 2 onward.
+  A weekly forecast-performance report (`src/reporting/weekly_report.py`,
+  `POST /reports/weekly`) that scores forecasts that were ACTUALLY
+  SERVED, once the real outcome is known, by lead time (horizon) and time
+  of day (block) — exactly where a forecast tends to be weakest — against
+  the same three untrained baselines (persistence, smart_persistence,
+  physics) `benchmark.py` already used for training-time evaluation.
+  Those baselines were factored out into `src/evaluation/baselines.py`
+  first, so `benchmark.py` and this new production report use identical
+  math, not two implementations that could quietly drift apart. Reports
+  a `beats_baseline` verdict per baseline (model nMAE below that
+  baseline's, computed, never assumed) alongside the raw numbers. Per the
+  roadmap, "contains no number that cannot be traced to raw data" —
+  every figure is a direct nMAE/nRMSE off the actual/predicted pairs
+  given; nothing is estimated. Rejects a request whose forecasts aren't
+  fully covered by the supplied readings (a report cannot honestly score
+  an outcome it wasn't given) with a clear 422. Tested with 9 unit tests
+  for the shared baselines (`tests/test_baselines.py`) plus 7 for the
+  report itself — every nMAE hand-computed from a small, fully
+  deterministic dataset (a constant clear-sky index so the physics
+  baseline is a known constant, and two different constant-actual days so
+  persistence/smart_persistence carry an exact, known error) — plus 5
+  end-to-end API tests.
+- **Not started:** real customer-file ingestion (P2.1) and any
+  real-plant validation — rest of Phase 2 onward.
 
 ## Known Gaps
 
@@ -389,6 +410,15 @@ any new feature work. As of this commit:
   contract-rate placeholder behind a schedule-revision suggestion's Rs
   figures. Nothing here has been exercised against a real operator's
   actual workflow — only synthetic trigger scenarios.
+- `POST /reports/weekly` (roadmap P2.9) has no forecast log to draw
+  on — `POST /forecast` doesn't persist what it returns anywhere, so a
+  caller must supply the served forecasts and their now-known actual
+  outcomes itself. This module has only been exercised on synthetic
+  data; wiring a real forecast log (so this report could genuinely run
+  unattended on a weekly cadence against live history) is future work,
+  as is the scheduler/cron layer itself — "generated unattended" here
+  describes the scoring math (deterministic, no human judgment calls),
+  not an actual deployed schedule.
 
 ---
 
