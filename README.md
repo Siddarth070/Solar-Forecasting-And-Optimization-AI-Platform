@@ -217,10 +217,35 @@ any new feature work. As of this commit:
   a count, and the specific timestamps — never a bare pass/fail. Tested
   with 14 unit tests (one engineered problem per test, checked not to
   accidentally trip a second check) plus 5 end-to-end API tests.
-- **Not started:** real customer-file ingestion (P2.1), loss attribution
-  (P2.4), schedule-risk scoring (P2.5), operator recommendations (P2.6),
-  weekly performance reports (P2.9), and any real-plant validation —
-  rest of Phase 2 onward.
+  A loss attribution engine (`src/attribution/loss.py`, `POST
+  /losses/attribute`) that compares actual generation against
+  expected-from-irradiance — reusing the exact PV physics formula
+  `src/ingestion/jaipur_simulator.py` uses to generate this project's own
+  training data (GHI × temperature-derated performance ratio × capacity),
+  just parameterized by each plant's own config instead of that
+  simulator's hardcoded constants — and classifies each block's material
+  residual loss into a cause with the evidence that produced it: weather
+  (a clear-sky-index ramp consistent with a passing cloud), equipment
+  (a sustained, irradiance-uncorrelated drop that still tracks the
+  underlying solar ramp's shape), curtailment (a hard flat output clip
+  while expected output keeps varying), or unknown (material loss with
+  no supporting pattern). A separate day-level check
+  (`daily_performance_ratio()` / `detect_soiling()`) flags a slow,
+  sustained decline in the daily actual/expected ratio over 10+ days as
+  suspected soiling — a trend invisible at single-block granularity.
+  Every classification carries a confidence label and the raw numbers
+  behind it, never a bare label. Tested with 12 unit tests (one
+  hand-computed loss scenario per cause, with exact expected MW values
+  worked out by hand, not just "it ran") plus 6 end-to-end API tests.
+  **Honestly limited, not fabricated:** this platform has no
+  per-inverter/string telemetry and no real grid curtailment-instruction
+  feed, so "equipment" and "curtailment" are always reported as
+  suspected/possible — the module's own docstring and every such block's
+  evidence text say so explicitly, never claiming a confirmed asset or a
+  confirmed grid order.
+- **Not started:** real customer-file ingestion (P2.1), schedule-risk
+  scoring (P2.5), operator recommendations (P2.6), weekly performance
+  reports (P2.9), and any real-plant validation — rest of Phase 2 onward.
 
 ## Known Gaps
 
@@ -282,6 +307,18 @@ any new feature work. As of this commit:
   trip it. It has also only been exercised on synthetic data — no real
   customer file, with real logger dropouts and re-export duplicates, has
   been run through it yet.
+- The loss attribution engine (`src/attribution/loss.py`) works from one
+  plant-level aggregate power reading and a single site-wide GHI/
+  temperature pair — it has no per-inverter or per-string telemetry, so
+  it can never confirm WHICH asset caused an "equipment" loss, only that
+  the aggregate pattern looks like one. It also has no real grid
+  curtailment-instruction feed (SLDC/RLDC order log), so a hard flat clip
+  is reported as "possible curtailment", never a confirmed grid-ordered
+  one — that confirmation needs a real QCA/grid-operator integration
+  (roadmap P2.7/P2.8, both explicitly deferred pending a real
+  counterparty). The soiling check needs 10+ real calendar days of
+  readings to fit a trend on; it has only been exercised on synthetic
+  multi-day scenarios, not a real degrading plant.
 
 ---
 

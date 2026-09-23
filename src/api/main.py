@@ -12,6 +12,7 @@ from xgboost import XGBRegressor
 PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent
 sys.path.insert(0, str(PROJECT_ROOT))
 
+from src.attribution.loss import attribute_losses, daily_performance_ratio, detect_soiling
 from src.features.pipeline import build_features, SERVING_FEATURE_COLUMNS
 from src.optimization.battery_optimizer import BatteryOptimizer
 from src.quality.gate import run_quality_checks
@@ -204,6 +205,24 @@ class QualityCheckRequest(BaseModel):
     """Request body for the data-quality gate (roadmap P2.2)."""
     plant_id: str = Field(default=DEFAULT_PLANT_ID)
     readings: list[GenerationReading] = Field(..., min_length=1)
+
+
+class LossReading(BaseModel):
+    """One raw generation + weather reading for loss attribution (roadmap
+    P2.4). Unlike the quality gate, attribution needs the actual measured
+    irradiance and temperature too -- it classifies losses against
+    expected-from-irradiance, which the plant's power reading alone can't
+    reconstruct."""
+    timestamp: str = Field(..., description="ISO8601 timestamp, e.g. '2024-06-01T09:00:00+05:30'.")
+    power_mw: float = Field(..., description="Reported generation in MW.")
+    ghi_w_m2: float = Field(..., description="Measured global horizontal irradiance, W/m^2.")
+    temperature_c: float = Field(..., description="Measured ambient temperature, degC.")
+
+
+class LossAttributionRequest(BaseModel):
+    """Request body for the loss attribution engine (roadmap P2.4)."""
+    plant_id: str = Field(default=DEFAULT_PLANT_ID)
+    readings: list[LossReading] = Field(..., min_length=1)
 
 
 # ── Endpoints ─────────────────────────────────────────────────
@@ -532,4 +551,50 @@ def quality_check(request: QualityCheckRequest):
         return report.to_dict()
     except Exception as e:
         logger.error(f"Quality check error: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/losses/attribute")
+def losses_attribute(request: LossAttributionRequest):
+    """
+    Classify every block with a material generation shortfall against
+    expected-from-irradiance into a cause -- weather, equipment
+    (suspected), curtailment (possible), or unknown -- with the evidence
+    that produced each call (roadmap P2.4). When at least 10 distinct
+    calendar days of readings are supplied, also runs the separate
+    day-level soiling check (a slow, sustained decline in the daily
+    actual/expected ratio -- not visible at single-block granularity).
+
+    See src/attribution/loss.py's module docstring for exactly what
+    "equipment" and "curtailment" here can and cannot confirm: this
+    platform has no per-inverter telemetry and no real grid
+    curtailment-instruction feed, so those two causes are always labelled
+    suspected/possible, never a confirmed asset or a confirmed grid order.
+    """
+    try:
+        plant_config = get_plant_config(request.plant_id)
+    except FileNotFoundError as e:
+        raise HTTPException(status_code=404, detail=str(e))
+
+    try:
+        timestamps = pd.DatetimeIndex([pd.Timestamp(r.timestamp) for r in request.readings])
+        df = pd.DataFrame(
+            {
+                "solar_output_mw": [r.power_mw for r in request.readings],
+                "shortwave_radiation": [r.ghi_w_m2 for r in request.readings],
+                "temperature_2m": [r.temperature_c for r in request.readings],
+            },
+            index=timestamps,
+        )
+        report = attribute_losses(df, plant_config)
+        result = report.to_dict()
+
+        daily_ratio = daily_performance_ratio(df, plant_config)
+        soiling = detect_soiling(daily_ratio)
+        result["soiling"] = soiling.to_dict() if soiling is not None else None
+        result["days_observed_for_soiling_check"] = len(daily_ratio)
+
+        return result
+    except Exception as e:
+        logger.error(f"Loss attribution error: {e}")
         raise HTTPException(status_code=500, detail=str(e))
