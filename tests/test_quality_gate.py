@@ -53,6 +53,33 @@ class TestMissingTimezone:
         checks = {i.check for i in report.issues}
         assert "missing_timezone" in checks
 
+    def test_mixed_aware_and_naive_timestamps_is_an_error_not_a_crash(self):
+        """A batch mixing tz-aware and tz-naive rows -- e.g. one bad row
+        from a different export -- can't even be unified into a single
+        pandas DatetimeIndex, so df.index falls back to a generic
+        object-dtype Index with no `.tz` attribute at all. This must
+        still be reported as missing_timezone, not raise."""
+        df = _clean_day()
+        mixed_index = list(df.index)
+        mixed_index[10] = mixed_index[10].tz_localize(None)
+        df.index = pd.Index(mixed_index)
+        report = run_quality_checks(df, PLANT)
+        assert report.passed is False
+        checks = {i.check for i in report.issues}
+        assert "missing_timezone" in checks
+
+    def test_mixed_timestamps_does_not_crash_the_timestamp_gap_check(self):
+        """Gap detection sorts the index -- mixed tz-aware/naive
+        timestamps can't be sorted (pandas raises TypeError) -- so it
+        must be skipped, not propagate an exception, when the timezone
+        check has already failed."""
+        df = _clean_day()
+        mixed_index = list(df.index)
+        mixed_index[10] = mixed_index[10].tz_localize(None)
+        df.index = pd.Index(mixed_index)
+        report = run_quality_checks(df, PLANT)  # must not raise
+        assert not any(i.check == "timestamp_gaps" for i in report.issues)
+
 
 class TestDuplicateTimestamps:
     def test_duplicated_row_is_flagged(self):

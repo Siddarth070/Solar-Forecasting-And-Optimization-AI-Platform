@@ -41,6 +41,26 @@ def get_recommendations_db():
     return recommendations_store.connect()
 
 
+def build_timestamp_index(raw_timestamps: list[str]) -> pd.DatetimeIndex:
+    """Parse ISO timestamp strings into one consistent, homogeneous
+    DatetimeIndex. Raises ValueError -- meant to be caught and turned
+    into a 422 -- if they can't form one, e.g. a mix of tz-aware and
+    tz-naive timestamps (pandas can't unify those into a single
+    DatetimeIndex at all, and would otherwise surface as a confusing
+    internal pandas error). Endpoints that need already-clean timestamps
+    (everything except POST /quality/check, whose entire job is
+    diagnosing exactly this kind of raw-data problem) should use this
+    instead of constructing a DatetimeIndex directly."""
+    idx = pd.Index([pd.Timestamp(t) for t in raw_timestamps])
+    if not isinstance(idx, pd.DatetimeIndex):
+        raise ValueError(
+            "Timestamps could not be parsed into one consistent timezone -- e.g. some "
+            "carry a UTC offset and others don't. Use POST /quality/check first to "
+            "diagnose raw data like this."
+        )
+    return idx
+
+
 # ── App setup ─────────────────────────────────────────────────
 app = FastAPI(
     title="Solar Forecast Platform",
@@ -409,7 +429,7 @@ def forecast(request: ForecastRequest):
         # build_features' cyclical encodings, are derived from the real
         # timestamp rather than supplied separately (so they can never
         # disagree with it).
-        timestamps = pd.DatetimeIndex([pd.Timestamp(h.timestamp) for h in request.hours])
+        timestamps = build_timestamp_index([h.timestamp for h in request.hours])
         raw = pd.DataFrame(
             [{
                 "hour": ts.hour,
@@ -464,6 +484,8 @@ def forecast(request: ForecastRequest):
             predictions_p90_mw  = p90_mw,
         )
 
+    except ValueError as e:
+        raise HTTPException(status_code=422, detail=str(e))
     except Exception as e:
         logger.error(f"Forecast error: {e}")
         raise HTTPException(status_code=500, detail=str(e))
@@ -671,7 +693,12 @@ def quality_check(request: QualityCheckRequest):
         raise HTTPException(status_code=404, detail=str(e))
 
     try:
-        timestamps = pd.DatetimeIndex([pd.Timestamp(r.timestamp) for r in request.readings])
+        # A plain pd.Index, not build_timestamp_index -- this endpoint's
+        # entire job is diagnosing raw data problems, including a mix of
+        # tz-aware and tz-naive timestamps, which falls back to a generic
+        # object-dtype Index here (see src/quality/gate.py's
+        # _check_missing_timezone) instead of being rejected outright.
+        timestamps = pd.Index([pd.Timestamp(r.timestamp) for r in request.readings])
         df = pd.DataFrame(
             {"solar_output_mw": [r.power_mw for r in request.readings]},
             index=timestamps,
@@ -706,7 +733,7 @@ def losses_attribute(request: LossAttributionRequest):
         raise HTTPException(status_code=404, detail=str(e))
 
     try:
-        timestamps = pd.DatetimeIndex([pd.Timestamp(r.timestamp) for r in request.readings])
+        timestamps = build_timestamp_index([r.timestamp for r in request.readings])
         df = pd.DataFrame(
             {
                 "solar_output_mw": [r.power_mw for r in request.readings],
@@ -724,6 +751,8 @@ def losses_attribute(request: LossAttributionRequest):
         result["days_observed_for_soiling_check"] = len(daily_ratio)
 
         return result
+    except ValueError as e:
+        raise HTTPException(status_code=422, detail=str(e))
     except Exception as e:
         logger.error(f"Loss attribution error: {e}")
         raise HTTPException(status_code=500, detail=str(e))
@@ -846,7 +875,7 @@ def recommendations_generate(request: RecommendationsGenerateRequest):
 
     if request.loss_readings is not None:
         try:
-            timestamps = pd.DatetimeIndex([pd.Timestamp(r.timestamp) for r in request.loss_readings])
+            timestamps = build_timestamp_index([r.timestamp for r in request.loss_readings])
             loss_df = pd.DataFrame(
                 {
                     "solar_output_mw": [r.power_mw for r in request.loss_readings],
@@ -856,6 +885,8 @@ def recommendations_generate(request: RecommendationsGenerateRequest):
                 index=timestamps,
             )
             loss_report = attribute_losses(loss_df, plant_config)
+        except ValueError as e:
+            raise HTTPException(status_code=422, detail=str(e))
         except Exception as e:
             logger.error(f"Recommendation loss-attribution error: {e}")
             raise HTTPException(status_code=500, detail=str(e))
@@ -925,7 +956,7 @@ def reports_weekly(request: WeeklyReportRequest):
         raise HTTPException(status_code=404, detail=str(e))
 
     try:
-        timestamps = pd.DatetimeIndex([pd.Timestamp(r.timestamp) for r in request.readings])
+        timestamps = build_timestamp_index([r.timestamp for r in request.readings])
         raw = pd.DataFrame(
             [{
                 "hour": ts.hour,

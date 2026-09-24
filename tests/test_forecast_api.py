@@ -70,6 +70,15 @@ class TestForecastRealTimestamps:
         resp = client.post("/forecast", json={"hours": [bad_hour], "plant_id": "jaipur_100mw"})
         assert resp.status_code == 422
 
+    def test_mixed_aware_and_naive_timestamps_returns_422_not_500(self, client):
+        # Regression test: pandas can't unify tz-aware and tz-naive
+        # timestamps into one DatetimeIndex at all -- this used to crash
+        # with a raw 500 (an unhandled pandas error) instead of a clear
+        # client-input rejection.
+        hours = [_hour("2024-06-15T08:00:00+05:30"), _hour("2024-06-15T09:00:00")]
+        resp = client.post("/forecast", json={"hours": hours, "plant_id": "jaipur_100mw"})
+        assert resp.status_code == 422
+
     def test_different_real_dates_are_actually_used_for_clear_sky(self, client):
         """Before this wiring, every request was silently re-anchored to a
         fixed placeholder date (year=2024, day=15) regardless of what the

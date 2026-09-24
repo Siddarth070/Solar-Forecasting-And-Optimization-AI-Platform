@@ -95,8 +95,28 @@ class QualityReport:
         return "\n".join(lines)
 
 
+_NOT_A_DATETIME_INDEX = object()  # sentinel: df.index isn't a real DatetimeIndex at all
+
+
 def _check_missing_timezone(df: pd.DataFrame) -> QualityIssue | None:
-    if df.index.tz is None:
+    """Flags two distinct real-world cases as the same error: every
+    timestamp is naive (df.index.tz is None, a proper DatetimeIndex), or
+    the batch MIXES tz-aware and tz-naive timestamps -- e.g. one bad row
+    from a different export -- which pandas can't even unify into a
+    single DatetimeIndex, so df.index falls back to a generic object
+    Index with no `.tz` attribute at all. Either way, this data cannot be
+    safely aligned to the 96-block IST grid or checked against real
+    sunrise/sunset, so both read as the same quality failure."""
+    tz = getattr(df.index, "tz", _NOT_A_DATETIME_INDEX)
+    if tz is _NOT_A_DATETIME_INDEX:
+        return QualityIssue(
+            check="missing_timezone", severity="error", count=len(df),
+            message="Timestamps could not be parsed into one consistent timezone -- e.g. "
+                    "some rows carry a UTC offset and others don't. Cannot be safely "
+                    "aligned to the 96-block IST grid or checked against real "
+                    "sunrise/sunset.",
+        )
+    if tz is None:
         return QualityIssue(
             check="missing_timezone", severity="error", count=len(df),
             message="Timestamps have no timezone -- cannot be safely aligned to the "
@@ -230,10 +250,17 @@ def run_quality_checks(df: pd.DataFrame, plant_config: dict,
     if tz_issue:
         issues.append(tz_issue)
 
-    for check in (_check_duplicate_timestamps, _check_timestamp_gaps):
-        issue = check(df)
-        if issue:
-            issues.append(issue)
+    dup_issue = _check_duplicate_timestamps(df)  # safe on any index dtype
+    if dup_issue:
+        issues.append(dup_issue)
+
+    # Gap detection sorts the index -- a mix of tz-aware and tz-naive
+    # timestamps can't be sorted at all (pandas raises), so skip it
+    # (rather than crash) if the timezone check already failed.
+    if tz_issue is None:
+        gap_issue = _check_timestamp_gaps(df)
+        if gap_issue:
+            issues.append(gap_issue)
 
     for issue in (
         _check_negative_power(df, power_column),

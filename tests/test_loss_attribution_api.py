@@ -103,6 +103,12 @@ class TestLossAttributionEndpoint:
         resp = client.post("/losses/attribute", json={"plant_id": "jaipur_100mw", "readings": []})
         assert resp.status_code == 422
 
+    def test_mixed_aware_and_naive_timestamps_returns_422_not_500(self, client):
+        readings = _clear_sky_readings(days=1)
+        readings[5]["timestamp"] = readings[5]["timestamp"].replace("+05:30", "")
+        resp = client.post("/losses/attribute", json={"plant_id": "jaipur_100mw", "readings": readings})
+        assert resp.status_code == 422
+
 
 class TestSoilingCheckViaEndpoint:
     def test_fewer_than_ten_days_reports_no_soiling_finding(self, client):

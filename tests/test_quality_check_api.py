@@ -65,6 +65,21 @@ class TestQualityCheckEndpoint:
         checks = {i["check"] for i in data["issues"]}
         assert "missing_timezone" in checks
 
+    def test_mixed_aware_and_naive_timestamps_is_reported_not_a_500(self, client):
+        # Regression test: some rows carry a UTC offset, one doesn't --
+        # pandas can't unify these into one DatetimeIndex at all, which
+        # used to crash this endpoint with a raw 500 (an unhandled
+        # "Cannot mix tz-aware with tz-naive values" pandas error)
+        # instead of reporting it as the data-quality problem it is.
+        readings = [_reading(f"2024-06-01T{h:02d}:00:00+05:30", 0.0) for h in range(24)]
+        readings[5]["timestamp"] = "2024-06-01T05:00:00"  # no offset
+        resp = client.post("/quality/check", json={"plant_id": "jaipur_100mw", "readings": readings})
+        assert resp.status_code == 200
+        data = resp.json()
+        assert data["passed"] is False
+        checks = {i["check"] for i in data["issues"]}
+        assert "missing_timezone" in checks
+
     def test_unknown_plant_returns_404(self, client):
         readings = [_reading("2024-06-01T12:00:00+05:30", 10.0)]
         resp = client.post("/quality/check", json={"plant_id": "does_not_exist", "readings": readings})
