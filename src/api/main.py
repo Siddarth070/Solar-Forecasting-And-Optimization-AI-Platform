@@ -14,6 +14,7 @@ sys.path.insert(0, str(PROJECT_ROOT))
 
 from src.attribution.loss import attribute_losses, daily_performance_ratio, detect_soiling
 from src.features.pipeline import build_features, SERVING_FEATURE_COLUMNS
+from src.onboarding.plant_registration import PlantAlreadyRegisteredError, register_plant
 from src.optimization.battery_optimizer import BatteryOptimizer
 from src.quality.gate import run_quality_checks
 from src.recommendations import store as recommendations_store
@@ -374,6 +375,86 @@ class WeeklyReportRequest(BaseModel):
     forecasts: list[ServedForecastRecord] = Field(..., min_length=1)
 
 
+class PlantLocationInput(BaseModel):
+    """Location block for onboarding a new plant (roadmap P2.3) --
+    mirrors configs/plants/<id>.yaml's `location` block."""
+    name: str = Field(..., min_length=1, max_length=200)
+    state: str = Field(..., min_length=1, max_length=100)
+    latitude: float = Field(..., ge=-90, le=90)
+    longitude: float = Field(..., ge=-180, le=180)
+    elevation_m: float | None = Field(
+        default=None, ge=-500, le=9000,
+        description="Optional. If omitted, left out of the stored config "
+                     "entirely (not written as null) -- every existing "
+                     "consumer's `.get('elevation_m', 0.0)` fallback then "
+                     "applies exactly as it does today."
+    )
+    timezone: str = Field(..., description="IANA timezone name, e.g. 'Asia/Kolkata'.")
+
+
+class PlantCapacityInput(BaseModel):
+    ac_capacity_mw: float = Field(..., gt=0, le=10000)
+    dc_capacity_mw: float = Field(..., gt=0, le=10000)
+    panel_efficiency: float = Field(..., gt=0, le=1)
+    temperature_coefficient: float = Field(..., ge=-0.02, le=0)
+    performance_ratio: float = Field(
+        ..., gt=0, le=1,
+        description="Required, never defaulted -- src/attribution/loss.py "
+                     "and src/evaluation/baselines.py index this with no "
+                     "fallback."
+    )
+    panel_area_m2: float = Field(..., gt=0)
+
+
+class PlantGridInput(BaseModel):
+    """Only export_limit_mw is captured today -- sldc/rldc/ists_or_instate/
+    qca_role/metering_point remain null (zero code reads them)."""
+    export_limit_mw: float = Field(
+        ..., gt=0, le=10000,
+        description="Contractual/regulatory cap on grid export (MW); may "
+                     "be less than capacity.ac_capacity_mw. Enforced by "
+                     "POST /optimize via a curtailment mechanism."
+    )
+
+
+class PlantEquipmentInput(BaseModel):
+    commercial_operation_date: str = Field(..., description="ISO 8601 date (YYYY-MM-DD).")
+    module_type: str = Field(..., min_length=1, max_length=200)
+    inverter_count: int = Field(..., ge=1, le=100000)
+
+
+class PlantRegulatoryInput(BaseModel):
+    seller_category: str = Field(
+        ..., description="Validated against the real WS-seller categories "
+                          "src/regulatory/dsm.py implements."
+    )
+    contract_rate_rs_per_kwh: float | None = Field(default=None, gt=0)
+    transaction_type: str | None = Field(
+        default=None,
+        description="'bilateral' or 'collective' (CERC IEGC 2023 Reg "
+                    "49(8)). If omitted, left out of the stored config "
+                    "entirely so every existing consumer's documented "
+                    "fallback applies unchanged."
+    )
+
+
+class PlantOnboardingRequest(BaseModel):
+    """POST /plants request body (roadmap P2.3)."""
+    plant_id: str = Field(..., min_length=2, max_length=50)
+    name: str = Field(..., min_length=1, max_length=200)
+    location: PlantLocationInput
+    capacity: PlantCapacityInput
+    grid: PlantGridInput
+    equipment: PlantEquipmentInput
+    regulatory: PlantRegulatoryInput
+
+
+class PlantOnboardingResponse(BaseModel):
+    plant_id: str
+    config_path: str
+    plant_config: dict
+
+
 # ── Endpoints ─────────────────────────────────────────────────
 
 @app.get("/health")
@@ -518,6 +599,7 @@ def optimize(request: OptimizeRequest):
         block_starts = block_boundaries(request.date)[:-1]  # 96 block-start timestamps
 
     dsm_kwargs = {}
+    export_limit_mw = None
     if request.plant_id is not None:
         try:
             plant_config = get_plant_config(request.plant_id)
@@ -536,6 +618,11 @@ def optimize(request: OptimizeRequest):
                 f"plant_id={request.plant_id!r} has no regulatory.contract_rate_rs_per_kwh "
                 f"configured -- falling back to the flat deviation_penalty_per_mwh."
             )
+        # Grid export cap (roadmap P2.3) -- a PHYSICAL constraint on the
+        # interconnection, independent of whether DSM mode is active
+        # above (a commercial concern), so it's read and applied
+        # regardless of dsm_kwargs.
+        export_limit_mw = (plant_config.get("grid") or {}).get("export_limit_mw")
 
     try:
         optimizer = BatteryOptimizer(
@@ -545,6 +632,7 @@ def optimize(request: OptimizeRequest):
             initial_charge_mwh    = request.initial_charge_mwh,
             dt_hours              = 0.25 if block_starts is not None else request.dt_hours,
             round_trip_efficiency = request.round_trip_efficiency,
+            export_limit_mw       = export_limit_mw,
             **dsm_kwargs,
         )
 
@@ -985,3 +1073,72 @@ def reports_weekly(request: WeeklyReportRequest):
     except Exception as e:
         logger.error(f"Weekly report error: {e}")
         raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/plants", response_model=PlantOnboardingResponse, status_code=201)
+def onboard_plant(request: PlantOnboardingRequest):
+    """
+    Self-serve plant onboarding (roadmap P2.3): "self-serve capture of
+    everything in P1.1 plus COD, module type, inverter count, grid export
+    limit." Acceptance criterion: "a new plant is live in under 30
+    minutes without your involvement" -- this endpoint writes
+    configs/plants/<plant_id>.yaml directly, the exact file every other
+    endpoint already reads via get_plant_config(), so a freshly onboarded
+    plant is immediately usable by GET /plants and every other endpoint,
+    with no restart and no code change.
+
+    SCOPED TO CONFIGURATION, NOT DATA: does not depend on roadmap P2.1
+    (CSV/Excel historical data upload, not yet built -- blocked on real
+    customer files). This only captures the plant metadata every
+    endpoint's plant_config argument needs; a freshly onboarded plant has
+    no historical generation data of its own until P2.1 exists or a
+    caller supplies readings directly (e.g. to POST /quality/check).
+
+    CREATE-ONLY: 409 if plant_id is already registered. There is no
+    update/edit endpoint -- get_plant_config() is @lru_cache'd, and
+    safely invalidating that cache for an in-place edit is future scope
+    (see README Known Gaps).
+
+    grid.export_limit_mw IS enforced, not just stored: POST /optimize
+    reads it and caps dispatch via a curtailment mechanism in
+    src/optimization/battery_optimizer.py.
+    """
+    try:
+        config = register_plant(
+            plant_id=request.plant_id,
+            name=request.name,
+            location=request.location.model_dump(),
+            capacity=request.capacity.model_dump(),
+            grid=request.grid.model_dump(),
+            equipment=request.equipment.model_dump(),
+            regulatory=request.regulatory.model_dump(),
+        )
+    except PlantAlreadyRegisteredError as e:
+        raise HTTPException(status_code=409, detail=str(e))
+    except ValueError as e:
+        raise HTTPException(status_code=422, detail=str(e))
+    except Exception as e:
+        logger.error(f"Plant onboarding failed for {request.plant_id!r}: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+    return PlantOnboardingResponse(
+        plant_id=config["plant_id"],
+        config_path=f"configs/plants/{config['plant_id']}.yaml",
+        plant_config=config,
+    )
+
+
+@app.get("/plants/{plant_id}")
+def plant_detail(plant_id: str):
+    """
+    Detail view for one configured plant (roadmap P2.3) -- the read-side
+    complement to GET /plants (lists IDs only) and POST /plants (creates
+    one). Returns exactly what get_plant_config() returns, i.e. exactly
+    what every forecasting/optimization/regulatory endpoint already reads
+    for this plant_id -- the fastest way to confirm a freshly onboarded
+    plant is really live.
+    """
+    try:
+        return get_plant_config(plant_id)
+    except FileNotFoundError as e:
+        raise HTTPException(status_code=404, detail=str(e))

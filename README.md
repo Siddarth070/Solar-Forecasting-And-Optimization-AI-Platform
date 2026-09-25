@@ -313,6 +313,46 @@ any new feature work. As of this commit:
   baseline is a known constant, and two different constant-actual days so
   persistence/smart_persistence carry an exact, known error) — plus 5
   end-to-end API tests.
+  A self-serve plant onboarding flow (`src/onboarding/plant_registration.py`,
+  `POST /plants`, `GET /plants/{plant_id}`, plus a matching form in the
+  Streamlit dashboard — roadmap P2.3) that writes a brand-new
+  `configs/plants/<plant_id>.yaml` directly, the same file every other
+  endpoint already reads via `get_plant_config()`, so a freshly onboarded
+  plant is live for every existing endpoint immediately, with no restart
+  and no code change — proven end-to-end in tests by onboarding a plant
+  and calling `POST /quality/check` and `POST /schedule/risk` against it
+  in the same test, and manually in the dashboard by onboarding a plant
+  through the real form and watching it appear in the plant selector.
+  Captures everything roadmap P1.1's schema holds plus the four fields
+  P2.3 adds: commercial operation date, module type, inverter count, and
+  a grid export-limit cap (`grid.export_limit_mw`, finally giving the
+  previously 100%-dormant `grid` block a real field) — the export limit
+  is **enforced**, not just stored: `POST /optimize` now caps dispatch at
+  it via a new curtailment mechanism in
+  `src/optimization/battery_optimizer.py` (a `curtail` variable, active
+  only when a limit is configured, so every existing caller that doesn't
+  set one gets an identical LP with zero behavior change). Deliberately
+  does **not** depend on roadmap P2.1 (CSV/Excel historical data upload,
+  not yet built) — this is plant *configuration* onboarding only, not
+  historical *data* ingestion, a separate concern P2.1 still owns.
+  Create-only (409 on a duplicate `plant_id`, no update/edit path —
+  `get_plant_config()`'s `@lru_cache` makes a safe in-place edit a
+  separate piece of future work). `plant_id` is defended against path
+  traversal two ways — a strict allowlist regex and an independent
+  resolved-path containment check — applied to BOTH the new write path
+  and a **pre-existing path-traversal bug found while building this**:
+  `get_plant_config()` used to build its file path as
+  `PLANTS_DIR / f"{plant_id}.yaml"` with no validation at all, and
+  `pathlib`'s `/` operator silently discards the left operand when the
+  right side is itself an absolute path, so `plant_id="/etc/passwd"`
+  resolved to `Path("/etc/passwd.yaml")`, not anything under
+  `configs/plants/` — every existing `plant_id`-accepting endpoint was
+  exposed to this; it's now fixed in `src/utils/config_loader.py` and
+  regression-tested. Tested with 27 unit tests for the pure registration
+  logic, 18 end-to-end API tests, 6 tests for the path-traversal fix
+  (`tests/test_config_loader.py`) plus a regression test through an
+  actual existing endpoint, and 4 tests for export-limit enforcement in
+  the optimizer.
 - **Not started:** real customer-file ingestion (P2.1) and any
   real-plant validation — rest of Phase 2 onward.
 
@@ -419,6 +459,28 @@ any new feature work. As of this commit:
   as is the scheduler/cron layer itself — "generated unattended" here
   describes the scoring math (deterministic, no human judgment calls),
   not an actual deployed schedule.
+- Plant onboarding (`POST /plants`, roadmap P2.3) is **create-only** —
+  there is no way to edit or update an already-registered plant's config
+  through the API or the dashboard form. `configs/plants/*.yaml` can
+  still be hand-edited on disk as before, but `get_plant_config()`'s
+  `@lru_cache` means a running server won't see a hand-edit until its
+  cache is cleared or it restarts — a real update endpoint needs a real
+  cache-invalidation story this task didn't build. There is also no
+  authentication or multi-tenancy anywhere (this platform remains
+  explicitly single-tenant — roadmap P2.11's multi-tenant rewrite depends
+  on P2.3 finishing first, not the other way around) — anyone who can
+  reach the API or the dashboard can register a plant. Onboarding a
+  plant's *configuration* is entirely separate from roadmap P2.1 (real
+  customer CSV/Excel data upload), which remains not started — a freshly
+  onboarded plant has zero historical generation data of its own until
+  P2.1 exists or a caller supplies readings directly. Onboarding-generated
+  YAML files don't carry the hand-written inline comments the two demo
+  files (`jaipur_100mw.yaml`, `pune_50mw.yaml`) have (`yaml.safe_dump`
+  doesn't preserve/produce them) — a cosmetic difference, not a data-loss
+  concern. `grid.sldc`/`rldc`/`ists_or_instate`/`qca_role`/`metering_point`
+  and `regulatory.schedule_format` remain permanently `null` for every
+  onboarded plant — not exposed as onboarding inputs at all, since zero
+  code reads any of them today.
 
 ---
 

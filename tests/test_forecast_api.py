@@ -79,6 +79,24 @@ class TestForecastRealTimestamps:
         resp = client.post("/forecast", json={"hours": hours, "plant_id": "jaipur_100mw"})
         assert resp.status_code == 422
 
+    def test_malicious_plant_id_returns_404_not_500(self, client):
+        # Regression test for a real path-traversal bug found while
+        # building roadmap P2.3: get_plant_config used to build its file
+        # path as PLANTS_DIR / f"{plant_id}.yaml" with no validation --
+        # pathlib's `/` operator silently discards the left operand when
+        # the right side is itself absolute, so plant_id="/etc/passwd"
+        # resolved to Path("/etc/passwd.yaml"), not anything under
+        # configs/plants/. Every plant_id-accepting endpoint was exposed;
+        # /forecast is exercised here as the representative case.
+        hours = [_hour("2024-06-15T08:00:00+05:30")]
+        resp = client.post("/forecast", json={"hours": hours, "plant_id": "/etc/passwd"})
+        assert resp.status_code == 404
+
+        resp2 = client.post("/forecast", json={
+            "hours": hours, "plant_id": "../../../../etc/passwd",
+        })
+        assert resp2.status_code == 404
+
     def test_different_real_dates_are_actually_used_for_clear_sky(self, client):
         """Before this wiring, every request was silently re-anchored to a
         fixed placeholder date (year=2024, day=15) regardless of what the

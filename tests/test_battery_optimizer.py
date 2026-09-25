@@ -251,3 +251,81 @@ class TestDsmMode:
         # 4 MW * 0.25h = 1 MWh under-injection, safely within VL1.
         df = opt.optimize(np.array([16.0]), np.array([20.0]))
         assert df.loc[0, "dsm_rs"] == pytest.approx(1.0 * 2500 * 1.00)  # 2500 Rs
+
+
+class TestExportLimit:
+    """Roadmap P2.3: grid.export_limit_mw is a real, contractual cap on
+    power delivered to the grid, which may be below the plant's own AC
+    capacity. export_limit_mw=None (the default) must change nothing;
+    when set, the LP must curtail (never just report an over-limit
+    number) whenever solar generation alone exceeds the cap and the
+    battery can't absorb the difference."""
+
+    def test_no_export_limit_is_unchanged(self):
+        # dt_hours=1.0 for simple arithmetic; identical inputs, only
+        # export_limit_mw differs (omitted vs explicit None).
+        kwargs = dict(
+            battery_capacity_mwh=20, charge_rate_mw=5, discharge_rate_mw=5,
+            initial_charge_mwh=10, dt_hours=1.0, round_trip_efficiency=1.0,
+            soc_floor_pct=0.0, soc_ceiling_pct=1.0,
+        )
+        solar = np.array([30.0])
+        schedule = np.array([10.0])
+        df_default = BatteryOptimizer(**kwargs).optimize(solar, schedule)
+        df_explicit_none = BatteryOptimizer(**kwargs, export_limit_mw=None).optimize(solar, schedule)
+        assert df_default.equals(df_explicit_none)
+        assert (df_default["curtailed_mw"] == 0.0).all()
+
+    def test_export_limit_forces_curtailment_when_battery_cannot_absorb_surplus(self):
+        # capacity=20 MWh, floor=0/ceiling=20 (pct 0/1), charge_rate=5,
+        # dt=1h, eff=1 (round_trip_efficiency=1.0) -- simple arithmetic.
+        # solar=50, schedule=10 -> surplus=40, but charge is capped at
+        # charge_rate=5 regardless of surplus. export_limit=30 forces
+        # curtailment of exactly 50 - 5(charge) - 30(cap) = 15 MW.
+        opt = BatteryOptimizer(
+            battery_capacity_mwh=20, charge_rate_mw=5, discharge_rate_mw=5,
+            initial_charge_mwh=10, dt_hours=1.0, round_trip_efficiency=1.0,
+            soc_floor_pct=0.0, soc_ceiling_pct=1.0, export_limit_mw=30,
+        )
+        df = opt.optimize(np.array([50.0]), np.array([10.0]))
+        row = df.loc[0]
+        assert row["charge_mw"] == pytest.approx(5.0, abs=0.01)
+        assert row["curtailed_mw"] == pytest.approx(15.0, abs=0.01)
+        grid_delivered = row["solar_mw"] - row["curtailed_mw"] + row["discharge_mw"] - row["charge_mw"]
+        assert grid_delivered == pytest.approx(30.0, abs=0.01)
+        assert grid_delivered <= 30.0 + 1e-6
+
+    def test_export_limit_prefers_charging_over_curtailing_when_battery_has_headroom(self):
+        # capacity=30 MWh, charge_rate=25, initial_charge=5 -> headroom
+        # exactly 25 MWh, matching charge_rate. solar=40, schedule=10,
+        # export_limit=15: charging the full 25 MW brings grid_delivered
+        # to exactly 40-25=15=cap, so curtailment should be exactly zero
+        # (charging costs less per MWh than curtailing, so the LP always
+        # maxes charge first).
+        opt = BatteryOptimizer(
+            battery_capacity_mwh=30, charge_rate_mw=25, discharge_rate_mw=25,
+            initial_charge_mwh=5, dt_hours=1.0, round_trip_efficiency=1.0,
+            soc_floor_pct=0.0, soc_ceiling_pct=1.0, export_limit_mw=15,
+            terminal_soc_target_mwh=5,
+        )
+        df = opt.optimize(np.array([40.0]), np.array([10.0]))
+        row = df.loc[0]
+        assert row["curtailed_mw"] == pytest.approx(0.0, abs=0.01)
+        assert row["charge_mw"] == pytest.approx(25.0, abs=0.01)
+
+    def test_rule_based_fallback_also_respects_export_limit(self):
+        opt = BatteryOptimizer(
+            battery_capacity_mwh=50, charge_rate_mw=20, discharge_rate_mw=20,
+            initial_charge_mwh=10, round_trip_efficiency=0.81, dt_hours=0.25,
+            export_limit_mw=10,
+        )
+        solar = np.array([100.0])
+        schedule = np.array([0.0])
+        df = opt._rule_based_fallback(solar, schedule)
+        # charge_amt = 20 (rate-limited); grid_delivered = 100 - 20 = 80,
+        # which exceeds export_limit=10 -> curtail the excess (70 MW),
+        # leaving grid_delivered = 10 exactly. Battery level is untouched
+        # by curtailment (matches the existing fallback test's own math).
+        assert df.loc[0, "battery_level_mwh"] == pytest.approx(14.5, abs=0.05)
+        assert df.loc[0, "curtailed_mw"] == pytest.approx(70.0, abs=0.01)
+        assert df.loc[0, "grid_balance_mw"] == pytest.approx(10.0, abs=0.01)

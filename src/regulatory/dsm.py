@@ -77,6 +77,13 @@ _VOLUME_LIMITS = {
     "wind": {"pre": (0.15, 0.20), "post": (0.10, 0.15)},
 }
 
+# Public re-export of _VOLUME_LIMITS' keys -- lets other modules (e.g.
+# src/onboarding/plant_registration.py, roadmap P2.3) validate a
+# seller_category against the one real ruleset this module implements,
+# without hardcoding a second copy of the list that could drift out of
+# sync if a category is ever added/removed here.
+SELLER_CATEGORIES = frozenset(_VOLUME_LIMITS)
+
 # Regulation 8(4): multiplier of contract rate for bands
 # [within VLwS(1), VLwS(1)-VLwS(2), beyond VLwS(2)].
 OVER_INJECTION_RATE_MULTIPLIERS = (1.00, 0.90, 0.00)   # receivable by seller

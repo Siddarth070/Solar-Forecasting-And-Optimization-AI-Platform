@@ -91,6 +91,14 @@ from src.time_blocks import BLOCK_MINUTES, block_of
 # bilateral transactions, not collective (exchange/pooled) transactions.
 WS_SELLER_REVISION_ELIGIBLE_TRANSACTION_TYPES = frozenset({"bilateral"})
 
+# The two real-world WS-seller transaction structures Regulation 49(8)
+# distinguishes. Only "bilateral" may revise a schedule at all (see
+# above) -- this is the full set of values plant onboarding (roadmap
+# P2.3) accepts for regulatory.transaction_type, so an onboarding caller
+# who types something else is told the two real options, not a bare
+# "invalid value".
+KNOWN_TRANSACTION_TYPES = frozenset({"bilateral", "collective"})
+
 # The complete D-1 day-ahead scheduling timeline, Regulation 49(1) --
 # reference/display only; nothing in this codebase submits a real D-1
 # schedule to a Load Despatch Centre or Power Exchange yet, so none of
