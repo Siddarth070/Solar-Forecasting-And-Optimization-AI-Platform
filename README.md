@@ -393,9 +393,34 @@ the moment real data lands.
   timestamps), the data-quality gate blocking a bad file before any
   network call happens, and the full pass-through path with and without
   a served model.
+- `src/evaluation/attribution_validation.py` — the P3.4 engine, built the
+  same way: `src/attribution/loss.py` (P2.4) already labels "equipment"
+  and "curtailment" as SUSPECTED/POSSIBLE, by its own docstring, because
+  this platform has no per-inverter telemetry and no real grid
+  curtailment-order feed. This module checks those two labels against a
+  plant-supplied O&M log (`start_timestamp`, `end_timestamp`,
+  `event_type` — again exactly the "outage notes" the P3.1 data request
+  already asks for) and reports precision/recall per class, which is
+  P3.4's acceptance criterion verbatim. "weather" and "unknown" aren't
+  scored against the log — there's no O&M ground truth for weather, and
+  scoring "unknown" against a log would just be checking whether the
+  model's own honest shrug happened to coincide with a logged event,
+  which isn't a useful question.
+- Tested in `tests/test_attribution_validation.py` (9 tests), all
+  against a synthetic generation series fed through the REAL
+  `attribute_losses()` (so the predicted causes are genuinely computed,
+  not hand-set) and a synthetic O&M log. Covers: log schema validation
+  (missing column, tz-naive timestamps, mixed timezones within a
+  column, an unrecognised event type being dropped rather than
+  miscoded), a log that matches the injected pattern scoring high
+  precision/recall, a log with zero time overlap scoring nothing
+  (`NaN`, not a fabricated zero), and a deliberately wrong log entry
+  correctly showing up as a false positive.
 - **Not started:** everything that needs a real plant's data to even
-  attempt — P3.2's actual run, P3.3 (signed-off accuracy report), P3.4
-  (attribution validated against real O&M logs), P3.5 (case study).
+  attempt — P3.2's actual run, P3.3 (signed-off accuracy report), P3.4's
+  actual run, P3.5 (case study). Outreach for P3.1 went out 2026-10-01
+  to seven targets (six named contacts plus NSEFI); as of this writing,
+  no replies yet.
 
 ## Known Gaps
 
