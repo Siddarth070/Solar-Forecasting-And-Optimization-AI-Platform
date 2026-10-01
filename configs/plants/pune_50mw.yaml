@@ -13,6 +13,16 @@
 plant_id: "pune_50mw"
 name: "Pune Solar Plant (simulated)"
 
+# Machine-readable honesty flags (served by GET /plants/{plant_id} so a
+# frontend can label these values instead of presenting them as facts).
+data_provenance:
+  simulated: true                 # no real plant, weather, or meter data behind this config
+  placeholder_fields:             # illustrative values, not real plant/commercial data
+    - capacity.dc_capacity_mw
+    - regulatory.contract_rate_rs_per_kwh
+  assumed_fields:                 # plausible but unverified for this plant
+    - regulatory.revision_windows.transaction_type
+
 location:
   name: "Pune"
   state: "Maharashtra"

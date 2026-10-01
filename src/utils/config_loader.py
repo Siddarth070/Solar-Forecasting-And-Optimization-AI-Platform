@@ -97,12 +97,15 @@ def get_plant_config(plant_id: str) -> dict:
         If configs/plants/<plant_id>.yaml does not exist. Lists the plant
         IDs that do exist, to make the mistake obvious.
     """
-    path = PLANTS_DIR / f"{plant_id}.yaml"
-    if not path.exists():
-        available = list_plant_ids()
+    # Membership check, not just path.exists(): plant_id arrives from API
+    # query strings, and "../config" would otherwise resolve to a real
+    # non-plant YAML outside configs/plants/.
+    available = list_plant_ids()
+    if plant_id not in available:
         raise FileNotFoundError(
-            f"No plant config at {path}. Available plant IDs: {available}"
+            f"Unknown plant_id {plant_id!r}. Available plant IDs: {available}"
         )
+    path = PLANTS_DIR / f"{plant_id}.yaml"
 
     with open(path, "r") as f:
         plant = yaml.safe_load(f)

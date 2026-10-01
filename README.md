@@ -204,6 +204,24 @@ any new feature work. As of this commit:
 - **Not started:** real customer-file ingestion, loss attribution, and
   any real-plant validation — Phase 2 onward.
 
+## API Endpoints
+
+| Method | Path | Purpose |
+|---|---|---|
+| GET | `/health` | Liveness + model-loaded check |
+| GET | `/plants` | Configured plant IDs |
+| GET | `/plants/{plant_id}` | Full plant config, incl. `data_provenance` (which values are simulated / placeholders / assumed) |
+| GET | `/model-card` | The served model's card: data window, backtest + holdout metrics vs baselines |
+| POST | `/forecast` | Hourly point + P10/P50/P90 forecast from caller-supplied weather |
+| GET | `/forecast/live?date=&plant_id=` | 96-block forecast for one plant-day, weather fetched server-side from Open-Meteo (502 on fetch failure, never fake weather) |
+| POST | `/optimize` | Battery dispatch LP (DSM-cost objective when `plant_id` given) |
+| POST | `/dsm/estimate` | CERC Reg. 8(4) DSM charges for a schedule vs an injection profile, per block |
+| POST | `/schedule/revise` | Apply a revision under IEGC 2023 gate-closure timing |
+| GET | `/schedule/gate-closures` | Next bilateral-revision and RTM gate-closure instants |
+
+Browser access is restricted to the origins in `CORS_ALLOW_ORIGINS`
+(comma-separated; defaults to the local frontend dev server).
+
 ## Known Gaps
 
 - The weather SIMULATOR (`src/ingestion/jaipur_simulator.py`) is still
@@ -244,6 +262,13 @@ any new feature work. As of this commit:
   "bilateral"` in `configs/plants/*.yaml` is an assumption (a solar IPP
   with a PPA is typically bilateral), not a verified fact about a real
   plant's actual sale structure.
+- `GET /forecast/live` resamples hourly model output onto the 96-block
+  grid by time-weighted interpolation; for P10/P90 that per-block band
+  is an approximation (quantiles don't interpolate exactly). It also
+  treats each Open-Meteo hourly row as the weather AT that timestamp,
+  as `/forecast` and the dashboard do, although Open-Meteo's radiation
+  values are preceding-hour means -- a train/serve timing question to
+  resolve once real data is onboarded.
 - LSTM and Prophet were explored in `notebooks/` but are not served; only
   XGBoost is in the product path. Those notebooks' own reported metrics
   predate the target-leakage fix and are marked invalid in-notebook.

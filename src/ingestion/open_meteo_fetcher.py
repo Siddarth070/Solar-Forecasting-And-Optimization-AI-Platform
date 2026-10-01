@@ -116,6 +116,43 @@ class OpenMeteoFetcher:
         )
         return df
 
+    def fetch_forecast_for_date(self, date: str, save_raw: bool = False) -> pd.DataFrame:
+        """
+        Fetch the hourly forecast covering one calendar date (IST) through
+        00:00 of the following day -- the extra trailing hour is what lets
+        the API integrate the full 24 hours onto the 96-block grid
+        (src/time_blocks.integrate_to_blocks needs the 24:00 endpoint).
+
+        Open-Meteo's forecast endpoint only serves roughly the past ~3
+        months to ~16 days ahead; outside that it returns an HTTP error,
+        which is raised, never replaced with made-up weather.
+
+        `save_raw` defaults to False here because this is called per API
+        request; writing a raw JSON file every call would grow data/raw/
+        unboundedly.
+        """
+        start = pd.Timestamp(date)
+        params = {
+            "latitude"  : self.location["latitude"],
+            "longitude" : self.location["longitude"],
+            "hourly"    : ",".join(self.variables),
+            "timezone"  : self.config["project"]["timezone"],
+            "start_date": start.strftime("%Y-%m-%d"),
+            "end_date"  : (start + timedelta(days=1)).strftime("%Y-%m-%d"),
+        }
+        raw_response = self._fetch_with_retry(
+            url    = self.sources["open_meteo"]["base_url"],
+            params = params,
+            label  = f"forecast_{params['start_date']}"
+        )
+
+        df = self._parse_response(raw_response)
+        df = df[df.index <= df.index[0].normalize() + pd.Timedelta(days=1)]
+        self._validate_dataframe(df)
+        if save_raw:
+            self._save_raw(raw_response, label=f"forecast_{params['start_date']}")
+        return df
+
     def fetch_historical(
         self,
         start_date: str,
