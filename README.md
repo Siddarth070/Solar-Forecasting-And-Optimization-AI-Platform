@@ -356,6 +356,47 @@ any new feature work. As of this commit:
 - **Not started:** real customer-file ingestion (P2.1) and any
   real-plant validation — rest of Phase 2 onward.
 
+### Phase 3 (shadow pilot) — P3.2 engine built ahead of P3.1
+
+Phase 3 is structurally gated on P3.1 — securing one real plant's
+historical dataset — which is **not done**: as of this writing, zero
+plants have agreed to share data, and the outreach to prospective
+contacts (drafted, not fabricated — six named people plus NSEFI, each
+tied to a real, independently verified source) hasn't been sent yet.
+Nothing below is a real P3.2 result; it's the pipeline that runs one
+the moment real data lands.
+
+- `src/evaluation/shadow_backtest.py` — given a plant-supplied CSV of
+  real historical AC export readings (`timestamp`, `power_mw` — exactly
+  the two columns the P3.1 data request asks for), this:
+  1. Runs the existing P2.2 data-quality gate first (`src/quality/gate.py`)
+     and refuses to backtest on data that fails it, per that module's own
+     rule: "the customer sees a quality report before they see a forecast."
+  2. Fetches **real** historical weather for the plant's own location and
+     exact date range from the Open-Meteo archive API — the same source
+     `src/ingestion/open_meteo_fetcher.py` already uses for the live
+     forecast path — so the plant only has to supply its own export data,
+     never weather.
+  3. Builds features with the existing `src/features/pipeline.py` and
+     scores the served model (if supplied) and all three P0.4 baselines
+     (`src/evaluation/baselines.py`: persistence, smart_persistence,
+     physics) against the real actuals, using the exact same nMAE/nRMSE
+     convention as `benchmark.py`'s rolling-origin backtest and final
+     holdout — this is what P3.2's acceptance criterion ("rolling-origin
+     results... with the baselines from P0.4 shown alongside") actually
+     asks for.
+- Tested end-to-end in `tests/test_shadow_backtest.py` (10 tests) against
+  **synthetic fixtures only**, with the weather fetch always mocked —
+  every test says explicitly it's a dry run proving the plumbing works,
+  not a real result. Covers: CSV schema validation (missing column,
+  mixed tz-aware/naive timestamps, non-numeric power, duplicate
+  timestamps), the data-quality gate blocking a bad file before any
+  network call happens, and the full pass-through path with and without
+  a served model.
+- **Not started:** everything that needs a real plant's data to even
+  attempt — P3.2's actual run, P3.3 (signed-off accuracy report), P3.4
+  (attribution validated against real O&M logs), P3.5 (case study).
+
 ## Known Gaps
 
 - The weather SIMULATOR (`src/ingestion/jaipur_simulator.py`) is still
