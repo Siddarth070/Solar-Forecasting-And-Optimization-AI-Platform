@@ -16,3 +16,12 @@ services:
     build: .
     ports:
       - "8501:8501"
+
+  # Web console (web/) -- static React build behind nginx, which also
+  # proxies /api/* to the api service above. Open http://localhost:8080
+  web:
+    build: ./web
+    ports:
+      - "8080:8080"
+    depends_on:
+      - api
