@@ -1,9 +1,12 @@
+import json
+import os
 import numpy as np
 import pandas as pd
 import sys
 from pathlib import Path
 from datetime import datetime
 from fastapi import FastAPI, HTTPException
+from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 from loguru import logger
 from xgboost import XGBRegressor
@@ -27,6 +30,21 @@ app = FastAPI(
     description="AI-based solar energy forecasting and grid optimization, "
                  "for any plant configured under configs/plants/",
     version="1.0.0"
+)
+
+# ── CORS (web console) ────────────────────────────────────────
+# The web console (web/) is a separate static site, so the browser needs
+# an explicit allow-list. Override with ZENITH_CORS_ORIGINS (comma-
+# separated) in deployment; the defaults cover local dev and the domain.
+_DEFAULT_ORIGINS = (
+    "http://localhost:5173,http://127.0.0.1:5173,http://localhost:8080,"
+    "https://zenith-energy.in,https://www.zenith-energy.in"
+)
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=[o.strip() for o in os.getenv("ZENITH_CORS_ORIGINS", _DEFAULT_ORIGINS).split(",") if o.strip()],
+    allow_methods=["GET", "POST"],
+    allow_headers=["Content-Type"],
 )
 
 # ── Load model on startup ─────────────────────────────────────
@@ -102,7 +120,14 @@ class ForecastResponse(BaseModel):
     peak_output_mw     : float
     peak_index         : int = Field(description="Position in predictions_mw/timestamps of the peak.")
     peak_timestamp     : str
-    total_generation_mwh: float
+    total_generation_mwh: float = Field(
+        description="Energy over the request: sum(MW) x interval_hours. "
+                     "Correct for hourly AND 15-minute inputs."
+    )
+    interval_hours     : float = Field(
+        description="Spacing between the request's timestamps, in hours "
+                     "(0.25 for a 96-block day, 1.0 for hourly)."
+    )
     generated_at       : str
     predictions_p10_mw : list[float] = Field(
         default_factory=list,
@@ -212,6 +237,44 @@ def plants():
     return {"plant_ids": list_plant_ids()}
 
 
+@app.get("/plants/{plant_id}")
+def plant_detail(plant_id: str):
+    """One plant's public configuration -- what the web console needs to
+    label charts and compute DSM penalties (capacity, location, the
+    regulatory fields, and which of them are placeholders)."""
+    try:
+        cfg = get_plant_config(plant_id)
+    except FileNotFoundError as e:
+        raise HTTPException(status_code=404, detail=str(e))
+    regulatory = cfg.get("regulatory") or {}
+    revision_windows = regulatory.get("revision_windows") or {}
+    return {
+        "plant_id": cfg.get("plant_id", plant_id),
+        "name": cfg.get("name", plant_id),
+        "location": {k: cfg["location"].get(k) for k in
+                     ("name", "state", "latitude", "longitude", "elevation_m", "timezone")},
+        "ac_capacity_mw": cfg["capacity"]["ac_capacity_mw"],
+        "regulatory": {
+            "dsm_ruleset_id": regulatory.get("dsm_ruleset_id"),
+            "seller_category": regulatory.get("seller_category"),
+            "contract_rate_rs_per_kwh": regulatory.get("contract_rate_rs_per_kwh"),
+            "transaction_type": revision_windows.get("transaction_type"),
+        },
+        # Both configured plants are simulated; the console must say so.
+        "simulated": "simulated" in str(cfg.get("name", "")).lower(),
+    }
+
+
+@app.get("/model-card")
+def model_card():
+    """The served model's card (src/models/model_card.json): data window,
+    features, rolling-origin backtest and holdout vs. baselines."""
+    path = PROJECT_ROOT / "src" / "models" / "model_card.json"
+    if not path.exists():
+        raise HTTPException(status_code=404, detail="model_card.json not found")
+    return json.loads(path.read_text())
+
+
 @app.post("/forecast", response_model=ForecastResponse)
 def forecast(request: ForecastRequest):
     """
@@ -272,6 +335,14 @@ def forecast(request: ForecastRequest):
 
         peak_idx = int(np.argmax(predictions))
 
+        # Energy = power x duration. Summing MW only equals MWh for hourly
+        # inputs -- a 96-block (15-min) request used to report 4x the true
+        # energy. Use the median spacing; a single timestamp is 1 hour.
+        if len(timestamps) > 1:
+            interval_hours = float(np.median(timestamps.to_series().diff().dropna().dt.total_seconds()) / 3600)
+        else:
+            interval_hours = 1.0
+
         logger.info(
             f"Forecast generated: {len(predictions)} hours, "
             f"peak {max(predictions):.1f} MW at {timestamps[peak_idx].isoformat()}"
@@ -295,7 +366,8 @@ def forecast(request: ForecastRequest):
             peak_output_mw      = round(max(predictions), 2),
             peak_index          = peak_idx,
             peak_timestamp      = timestamps[peak_idx].isoformat(),
-            total_generation_mwh= round(sum(predictions), 2),
+            total_generation_mwh= round(sum(predictions) * interval_hours, 2),
+            interval_hours      = interval_hours,
             generated_at        = datetime.now().isoformat(),
             predictions_p10_mw  = p10_mw,
             predictions_p50_mw  = p50_mw,
@@ -346,6 +418,9 @@ def optimize(request: OptimizeRequest):
                 dsm_contract_rate_rs_per_kwh=contract_rate,
                 dsm_available_capacity_mw=plant_config["capacity"]["ac_capacity_mw"],
                 dsm_seller_category=regulatory.get("seller_category", "solar"),
+                # Volume limits switch on 01.04.2026 (dsm.CUTOVER_DATE): settle
+                # against the schedule's own date, not the server's today.
+                **({"dsm_as_of": pd.Timestamp(request.date).date()} if request.date else {}),
             )
         else:
             logger.warning(
