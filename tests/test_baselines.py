@@ -84,6 +84,25 @@ class TestSmartPersistenceBaseline:
         result = smart_persistence_baseline(y, features, PLANT_CONFIG)
         assert result.isna().all() or (result == 0).all()  # 0/0 -> NaN -> clipped NaN stays NaN
 
+    def test_near_zero_clear_sky_power_does_not_blow_up(self):
+        # A real-world edge case this project's synthetic simulator never
+        # produces, but real sensor data does (found via NREL PVDAQ system
+        # 9068 real-data validation, research/): yesterday's clear-sky power
+        # is tiny but nonzero (dawn/dusk), while actual output that hour was
+        # disproportionately large -- without bounding the ratio, today's
+        # prediction scales by the same huge factor.
+        idx = pd.date_range("2024-01-01", periods=48, freq="h")
+        csghi = pd.Series(1000.0, index=idx)
+        csghi.iloc[10] = 0.5  # yesterday's hour 10: clear-sky GHI tiny but not 0
+        features = pd.DataFrame({"clear_sky_ghi_model": csghi}, index=idx)
+        y = pd.Series(0.0, index=idx)
+        y.iloc[10] = 2.0  # 2 MW actual against ~0.04 MW of clear-sky power -> ratio 50
+        result = smart_persistence_baseline(y, features, PLANT_CONFIG)
+        # Today's (hour 10+LAG_HOURS) clear-sky power is a normal 80 MW;
+        # the ratio clip (<=1.3) keeps the prediction physically sane
+        # (<=104 MW) instead of the ~4000 MW an unbounded ratio would give.
+        assert result.iloc[10 + LAG_HOURS] == pytest.approx(1.3 * 80.0)
+
 
 class TestNmaeNrmse:
     def test_hand_computed_mae_and_rmse(self):

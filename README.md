@@ -64,6 +64,48 @@ this yet. The model previously reported here (an unrelated, now-removed
 2.17% MAPE figure) suffered from target leakage and is not comparable to
 the number above — see `git log` for the fix.
 
+### First real-data check (non-Indian, research-only — not P3.1)
+
+Every number above is synthetic. `validate_real_data_nrel_pvdaq.py` runs
+this project's P0.4 baselines and P2.2 quality gate against **real**
+measured generation data for the first time — NREL PVDAQ system 9068
+("SR_CO"), a public research plant in Kersey, Colorado (single-axis
+tracker, CdTe, 4.738 MW DC, ~6.2 years of 5-minute revenue-grade
+metering). Data: [DOI:10.25984/1846021](https://dx.doi.org/10.25984/1846021),
+© 2024 Alliance for Sustainable Energy, LLC, BSD-3-Clause-style license.
+
+**This is explicitly not roadmap P3.1** — wrong country (no CERC/IEGC
+relevance), wrong technology (this project's physics baseline assumes a
+fixed-tilt plant; this one is a tracker), and several plant facts
+(AC capacity, performance ratio) are fitted from the data itself rather
+than read from a nameplate spec, since the public dataset doesn't give
+them — see the script's own output for exactly which numbers are real
+vs. inferred.
+
+What it actually found, for real:
+- The quality gate (P2.2), pointed at real data for the first time,
+  correctly flagged 40 above-capacity blocks, 111 night-time-non-zero
+  blocks, and 68 timestamp gaps — real messiness a synthetic simulator
+  never produces, caught by code that had only ever seen clean data.
+- A genuine bug in `smart_persistence_baseline`: a near-zero (not exactly
+  zero) clear-sky-power denominator at dawn/dusk — common in real sensor
+  data, never produced by the synthetic simulator — blew up one day's
+  prediction to 715 MW for a ~4 MW plant (nRMSE 150%). Fixed by bounding
+  the ratio to the same `[0, 1.3]` range this project's own
+  `clear_sky_index` already uses elsewhere; nRMSE dropped to 31.6%,
+  in line with plain persistence. Regression test:
+  `tests/test_baselines.py::TestSmartPersistenceBaseline::test_near_zero_clear_sky_power_does_not_blow_up`.
+- Baseline scores on the real 6.2-year history: persistence nMAE 21.6%,
+  smart persistence 23.2%, physics 35.7% — all an order of magnitude
+  worse than the synthetic numbers above, exactly as expected for a
+  harder real plant with real sensor noise, gaps, and a technology this
+  project's methods weren't tuned for. Not a result to market; a sign the
+  harness behaves honestly on real difficulty instead of silently
+  inflating.
+
+The raw data isn't vendored in this repo (~380 MB); the script's own
+docstring gives the exact download commands to reproduce this.
+
 ---
 
 ## Architecture

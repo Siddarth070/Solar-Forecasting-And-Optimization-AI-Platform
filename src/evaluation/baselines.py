@@ -49,6 +49,16 @@ def smart_persistence_baseline(y: pd.Series, features: pd.DataFrame, plant_confi
     at or after t, so this is a legitimate forecast, not a leak."""
     csp = clear_sky_power(features, plant_config)
     ratio_yesterday = (y / csp.replace(0, np.nan)).shift(LAG_HOURS)
+    # Bound the ratio to the same physically-sane range this project's own
+    # clear_sky_index already uses (src.features.pipeline) -- without this,
+    # a near-zero (but nonzero) clear-sky-power denominator at dawn/dusk
+    # produces an arbitrarily large ratio that blows up TODAY's prediction
+    # by the same factor. This project's synthetic simulator never hits
+    # this edge case; real sensor data does -- found via real-data
+    # validation against NREL PVDAQ system 9068 (research/, not a product
+    # plant), where one such row produced a 715 MW prediction for a ~4 MW
+    # plant.
+    ratio_yesterday = ratio_yesterday.clip(lower=0, upper=1.3)
     return (csp * ratio_yesterday).clip(lower=0)
 
 
