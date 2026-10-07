@@ -33,8 +33,40 @@ npm test                                  # unit tests (weather alignment, DSM l
 Or everything at once from the repo root: `docker compose up --build`, then
 open http://localhost:8080 (nginx serves the build and proxies `/api`).
 
-## Deploy
+## Deploy (make it public)
 
-- **Static site (Netlify, zenith-energy.in):** base directory `web`; `netlify.toml` handles the build and SPA routes.
-- **API:** host the existing Docker image anywhere that runs a container (Render, Railway, Fly, a VM) with `uvicorn src.api.main:app --host 0.0.0.0 --port 8000`.
-- Set `VITE_API_URL=https://<your-api-host>` in Netlify, and `ZENITH_CORS_ORIGINS=https://zenith-energy.in,https://www.zenith-energy.in` on the API.
+Two pieces: the static site (Netlify) and the API (Render). The console
+only ever *reads* from the API, so the API runs read-only in public.
+
+1. **API on Render.** New -> Blueprint -> this repo; `render.yaml` at the
+   repo root defines the service. When prompted, set
+   `ZENITH_CORS_ORIGINS` to the site's exact origins (step 3's domain plus
+   the `https://<name>.netlify.app` URL). Check
+   `https://<api>.onrender.com/health` returns `"model_loaded": true`.
+2. **Site on Netlify.** Add new site -> import this repo -> base directory
+   `web` (`netlify.toml` does the build and SPA routes). Under Site
+   configuration -> Environment variables set
+   `VITE_API_URL=https://<api>.onrender.com`, then redeploy (Vite bakes it
+   in at build time).
+3. **Domain.** Buy it, add it under Netlify -> Domain management (apex +
+   `www`), point DNS as Netlify shows; HTTPS is automatic. Optionally add
+   `api.<domain>` as a Render custom domain and use that in
+   `VITE_API_URL`. Add every origin you serve the site from to
+   `ZENITH_CORS_ORIGINS`.
+4. **Check.** Open the site; the browser console must show no CORS
+   errors; `curl -X POST https://<api>/plants` must return 403.
+
+Public-API guards (`src/api/main.py`), all configured by env vars:
+
+| Variable | Default | Effect |
+|---|---|---|
+| `ZENITH_CORS_ORIGINS` | local dev origins | Browser origins allowed to call the API. Never `*`. |
+| `ZENITH_WRITE_API_KEY` | unset | If set, write endpoints need `X-API-Key: <value>`. |
+| `ZENITH_ALLOW_OPEN_WRITES` | unset | `1` opens write endpoints with no key. Local/docker compose only. |
+| `ZENITH_RATE_LIMIT_PER_MIN` | `60` | POSTs per client per minute (`0` = off). Bodies over 1 MB get 413. |
+| `ZENITH_TRUST_PROXY` | unset | `1` behind Render/Railway/Fly so clients are told apart by IP. |
+
+Known limits of the free tiers: Render's free plan sleeps when idle (the
+first request after that takes ~30-60 s) and its disk is wiped on every
+deploy, so anything written through the API (onboarded plants,
+recommendation decisions) does not persist there.

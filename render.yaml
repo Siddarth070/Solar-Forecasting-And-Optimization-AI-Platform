@@ -1,0 +1,26 @@
+# Render Blueprint for the Zenith API (the web console itself goes on
+# Netlify -- see web/README.md "Deploy"). In Render: New -> Blueprint ->
+# pick this repo. You'll be prompted for the `sync: false` values.
+services:
+  - type: web
+    name: zenith-api
+    runtime: docker
+    plan: free            # sleeps after ~15 min idle (slow first request); "starter" stays up
+    dockerfilePath: ./Dockerfile
+    dockerCommand: uvicorn src.api.main:app --host 0.0.0.0 --port 8000
+    healthCheckPath: /health
+    envVars:
+      - key: PORT
+        value: "8000"
+      # Exact site origins, comma-separated, e.g.
+      # https://zenith-energy.in,https://www.zenith-energy.in,https://<site>.netlify.app
+      - key: ZENITH_CORS_ORIGINS
+        sync: false
+      # Render's proxy appends the real client IP to X-Forwarded-For.
+      - key: ZENITH_TRUST_PROXY
+        value: "1"
+      - key: ZENITH_RATE_LIMIT_PER_MIN
+        value: "60"
+      # Write endpoints (POST /plants, /recommendations writes) stay closed
+      # unless you set ZENITH_WRITE_API_KEY in the Render dashboard. Never
+      # set ZENITH_ALLOW_OPEN_WRITES here.

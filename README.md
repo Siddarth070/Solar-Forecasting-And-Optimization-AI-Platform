@@ -608,11 +608,16 @@ Browser access is restricted to the origins in `ZENITH_CORS_ORIGINS`
   still be hand-edited on disk as before, but `get_plant_config()`'s
   `@lru_cache` means a running server won't see a hand-edit until its
   cache is cleared or it restarts — a real update endpoint needs a real
-  cache-invalidation story this task didn't build. There is also no
-  authentication or multi-tenancy anywhere (this platform remains
-  explicitly single-tenant — roadmap P2.11's multi-tenant rewrite depends
-  on P2.3 finishing first, not the other way around) — anyone who can
-  reach the API or the dashboard can register a plant. Onboarding a
+  cache-invalidation story this task didn't build. There is no
+  user authentication or multi-tenancy (this platform remains explicitly
+  single-tenant — roadmap P2.11's multi-tenant rewrite depends on P2.3
+  finishing first, not the other way around). The API's write endpoints
+  (`POST /plants`, the `/recommendations` writes) are closed unless
+  `ZENITH_WRITE_API_KEY` (one shared key, not per-user auth) or, locally,
+  `ZENITH_ALLOW_OPEN_WRITES=1` is set — see `web/README.md`'s Deploy
+  section. The Streamlit dashboard's onboarding form calls the
+  registration code directly, not the API, so it is NOT covered by that
+  guard: don't expose the Streamlit app publicly with that form enabled. Onboarding a
   plant's *configuration* is entirely separate from roadmap P2.1 (real
   customer CSV/Excel data upload), which remains not started — a freshly
   onboarded plant has zero historical generation data of its own until

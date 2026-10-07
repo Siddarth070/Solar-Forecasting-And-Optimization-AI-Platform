@@ -8,6 +8,10 @@ services:
       # Never "*". (The web service below reaches the API through its own
       # nginx /api proxy, i.e. same-origin, so it needs no entry here.)
       ZENITH_CORS_ORIGINS: "http://localhost:5173,http://127.0.0.1:5173,http://localhost:8080"
+      # Local only: lets POST /plants and the /recommendations writes work
+      # without a key. Never set this on a public deployment -- set
+      # ZENITH_WRITE_API_KEY there instead (see web/README.md "Deploy").
+      ZENITH_ALLOW_OPEN_WRITES: "1"
     ports:
       - "8000:8000"
     healthcheck:

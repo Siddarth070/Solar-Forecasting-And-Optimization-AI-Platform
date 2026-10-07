@@ -1,13 +1,18 @@
 import copy
+import hmac
 import json
 import os
+import threading
+import time
+from collections import defaultdict, deque
 import numpy as np
 import pandas as pd
 import sys
 from pathlib import Path
 from datetime import datetime
-from fastapi import FastAPI, HTTPException
+from fastapi import Depends, FastAPI, Header, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
 from loguru import logger
 from xgboost import XGBRegressor
@@ -36,6 +41,7 @@ from src.time_blocks import BLOCKS_PER_DAY, BLOCK_MINUTES, block_boundaries, int
 from src.utils.config_loader import get_plant_config, list_plant_ids
 
 DEFAULT_PLANT_ID = "jaipur_100mw"
+MAX_BLOCKS = 7 * BLOCKS_PER_DAY  # one week of 15-minute blocks: cap on per-block request lists
 
 
 def get_recommendations_db():
@@ -89,6 +95,74 @@ app.add_middleware(
     allow_methods=["GET", "POST"],
     allow_headers=["Content-Type", "X-API-Key"],
 )
+
+# ── Public-deployment guards ──────────────────────────────────
+# Endpoints that WRITE server state (POST /plants writes a YAML file; the
+# /recommendations POSTs write the SQLite log) are closed by default, so a
+# deployment that forgets to configure anything is read-only rather than
+# open to anyone on the internet. Exactly one of these opens them:
+#   ZENITH_WRITE_API_KEY=<secret>  -> callers must send X-API-Key: <secret>
+#   ZENITH_ALLOW_OPEN_WRITES=1     -> no key needed (local dev / docker compose only)
+# Read from the environment per request so tests can toggle them.
+
+def require_write_access(x_api_key: str | None = Header(default=None)) -> None:
+    key = os.getenv("ZENITH_WRITE_API_KEY")
+    if key:
+        if x_api_key is None or not hmac.compare_digest(x_api_key, key):
+            raise HTTPException(status_code=401, detail="This endpoint needs a valid X-API-Key header.")
+        return
+    if os.getenv("ZENITH_ALLOW_OPEN_WRITES") == "1":
+        return
+    raise HTTPException(
+        status_code=403,
+        detail="Write endpoints are disabled on this deployment (set ZENITH_WRITE_API_KEY "
+               "or, for local use only, ZENITH_ALLOW_OPEN_WRITES=1).",
+    )
+
+
+# Request-size cap and per-client rate limit on POSTs: the compute
+# endpoints (an LP solve per /optimize call) are open to the public, so
+# bound what one client can make the server do. ZENITH_RATE_LIMIT_PER_MIN
+# = 0 disables the limit. Behind a hosting proxy (Render, Railway, Fly)
+# every request arrives from the proxy's IP, so set ZENITH_TRUST_PROXY=1
+# there: clients are then keyed by the LAST X-Forwarded-For entry, the
+# one the proxy itself appended (earlier entries are client-supplied and
+# spoofable). Leave it unset when nothing sits in front of uvicorn.
+MAX_BODY_BYTES = 1_000_000
+_rate_hits: dict[str, deque] = defaultdict(deque)
+_rate_lock = threading.Lock()
+
+
+def _client_key(request: Request) -> str:
+    if os.getenv("ZENITH_TRUST_PROXY") == "1":
+        forwarded = request.headers.get("x-forwarded-for", "")
+        if forwarded:
+            return forwarded.split(",")[-1].strip()
+    return request.client.host if request.client else "unknown"
+
+
+@app.middleware("http")
+async def limit_requests(request: Request, call_next):
+    if request.method == "POST":
+        length = request.headers.get("content-length")
+        if length is not None and length.isdigit() and int(length) > MAX_BODY_BYTES:
+            return JSONResponse(status_code=413, content={"detail": f"Request body over {MAX_BODY_BYTES} bytes."})
+
+        limit = int(os.getenv("ZENITH_RATE_LIMIT_PER_MIN", "60"))
+        if limit > 0:
+            now = time.monotonic()
+            with _rate_lock:
+                hits = _rate_hits[_client_key(request)]
+                while hits and now - hits[0] > 60:
+                    hits.popleft()
+                if len(hits) >= limit:
+                    return JSONResponse(
+                        status_code=429, headers={"Retry-After": "60"},
+                        content={"detail": f"Rate limit: {limit} POST requests per minute."},
+                    )
+                hits.append(now)
+    return await call_next(request)
+
 
 # ── Load model on startup ─────────────────────────────────────
 # JSON, not pickle: a pickle can silently break across library versions
@@ -192,9 +266,9 @@ class ForecastResponse(BaseModel):
 
 class OptimizeRequest(BaseModel):
     """Request body for optimization endpoint."""
-    solar_forecast_mw : list[float] = Field(..., description="Solar forecast, one value per block")
+    solar_forecast_mw : list[float] = Field(..., max_length=MAX_BLOCKS, description="Solar forecast, one value per block")
     declared_schedule_mw: list[float] = Field(
-        ..., description="What the plant committed to deliver to the grid, "
+        ..., max_length=MAX_BLOCKS, description="What the plant committed to deliver to the grid, "
                           "one value per block — not a demand forecast "
                           "(roadmap P1.6: a solar IPP has a schedule, not demand)."
     )
@@ -287,9 +361,9 @@ class DsmEstimateRequest(BaseModel):
     """Request body for POST /dsm/estimate (CERC DSM Regulations 2024,
     Regulation 8(4), via src/regulatory/dsm.py)."""
     plant_id: str = Field(default=DEFAULT_PLANT_ID)
-    scheduled_mw: list[float] = Field(..., min_length=1, description="Declared schedule, mean MW per block.")
+    scheduled_mw: list[float] = Field(..., min_length=1, max_length=MAX_BLOCKS, description="Declared schedule, mean MW per block.")
     injected_mw: list[float] = Field(
-        ..., min_length=1,
+        ..., min_length=1, max_length=MAX_BLOCKS,
         description="Actual (or forecast/dispatched) injection, mean MW per block, "
                      "same length and alignment as scheduled_mw."
     )
@@ -1223,7 +1297,7 @@ def schedule_risk(request: ScheduleRiskRequest):
     return report.to_dict()
 
 
-@app.post("/recommendations/generate")
+@app.post("/recommendations/generate", dependencies=[Depends(require_write_access)])
 def recommendations_generate(request: RecommendationsGenerateRequest):
     """
     Generate operator recommendations (roadmap P2.6) -- schedule
@@ -1325,7 +1399,7 @@ def recommendations_list(plant_id: str | None = None, status: str | None = None)
     return {"recommendations": recommendations_store.list_recommendations(conn, plant_id=plant_id, status=status)}
 
 
-@app.post("/recommendations/{recommendation_id}/decide")
+@app.post("/recommendations/{recommendation_id}/decide", dependencies=[Depends(require_write_access)])
 def recommendations_decide(recommendation_id: int, request: RecommendationDecisionRequest):
     """
     Record a human operator's explicit approve/dismiss decision on a
@@ -1394,7 +1468,8 @@ def reports_weekly(request: WeeklyReportRequest):
         raise HTTPException(status_code=500, detail=str(e))
 
 
-@app.post("/plants", response_model=PlantOnboardingResponse, status_code=201)
+@app.post("/plants", response_model=PlantOnboardingResponse, status_code=201,
+          dependencies=[Depends(require_write_access)])
 def onboard_plant(request: PlantOnboardingRequest):
     """
     Self-serve plant onboarding (roadmap P2.3): "self-serve capture of

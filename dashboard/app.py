@@ -11,6 +11,8 @@ import streamlit as st
 import pandas as pd
 import numpy as np
 import plotly.graph_objects as go
+import os
+import os
 import requests
 import sys
 from pathlib import Path
@@ -50,87 +52,91 @@ with st.sidebar:
     # API), so onboarding here writes the exact same
     # configs/plants/<id>.yaml file POST /plants does. No new backend
     # logic; every validation rule lives in plant_registration.py.
-    with st.expander("➕ Onboard a new plant", expanded=False):
-        with st.form("onboard_plant_form"):
-            st.caption("Configuration only -- historical data upload is a separate, not-yet-built feature (roadmap P2.1).")
-            new_plant_id = st.text_input("Plant ID (lowercase, digits, underscores)", placeholder="kolar_75mw")
-            new_name = st.text_input("Plant name", placeholder="Kolar Solar Plant")
+    # It writes to the server's disk, so -- like the API's write endpoints
+    # -- it only appears when ZENITH_ALLOW_OPEN_WRITES=1 (local use; never
+    # set that on the public Streamlit Cloud deploy).
+    if os.getenv("ZENITH_ALLOW_OPEN_WRITES") == "1":
+        with st.expander("➕ Onboard a new plant", expanded=False):
+            with st.form("onboard_plant_form"):
+                st.caption("Configuration only -- historical data upload is a separate, not-yet-built feature (roadmap P2.1).")
+                new_plant_id = st.text_input("Plant ID (lowercase, digits, underscores)", placeholder="kolar_75mw")
+                new_name = st.text_input("Plant name", placeholder="Kolar Solar Plant")
 
-            st.markdown("**Location**")
-            loc_name = st.text_input("Location name", placeholder="Kolar")
-            loc_state = st.text_input("State", placeholder="Karnataka")
-            loc_lat = st.number_input("Latitude", -90.0, 90.0, 13.13)
-            loc_lon = st.number_input("Longitude", -180.0, 180.0, 78.13)
-            loc_tz = st.text_input("Timezone (IANA)", value="Asia/Kolkata")
-            include_elevation = st.checkbox("Specify elevation")
-            loc_elevation = st.number_input("Elevation (m)", -500.0, 9000.0, 0.0) if include_elevation else None
+                st.markdown("**Location**")
+                loc_name = st.text_input("Location name", placeholder="Kolar")
+                loc_state = st.text_input("State", placeholder="Karnataka")
+                loc_lat = st.number_input("Latitude", -90.0, 90.0, 13.13)
+                loc_lon = st.number_input("Longitude", -180.0, 180.0, 78.13)
+                loc_tz = st.text_input("Timezone (IANA)", value="Asia/Kolkata")
+                include_elevation = st.checkbox("Specify elevation")
+                loc_elevation = st.number_input("Elevation (m)", -500.0, 9000.0, 0.0) if include_elevation else None
 
-            st.markdown("**Capacity**")
-            cap_ac = st.number_input("AC capacity (MW)", min_value=0.1, value=50.0)
-            cap_dc = st.number_input("DC capacity (MW)", min_value=0.1, value=60.0)
-            cap_eff = st.number_input("Panel efficiency (0-1)", 0.01, 1.0, 0.20)
-            cap_temp_coef = st.number_input("Temperature coefficient (%/°C)", -0.02, 0.0, -0.004, format="%.4f")
-            cap_pr = st.number_input("Performance ratio (0-1)", 0.01, 1.0, 0.80)
-            cap_area = st.number_input("Panel area (m²)", min_value=1.0, value=250000.0)
+                st.markdown("**Capacity**")
+                cap_ac = st.number_input("AC capacity (MW)", min_value=0.1, value=50.0)
+                cap_dc = st.number_input("DC capacity (MW)", min_value=0.1, value=60.0)
+                cap_eff = st.number_input("Panel efficiency (0-1)", 0.01, 1.0, 0.20)
+                cap_temp_coef = st.number_input("Temperature coefficient (%/°C)", -0.02, 0.0, -0.004, format="%.4f")
+                cap_pr = st.number_input("Performance ratio (0-1)", 0.01, 1.0, 0.80)
+                cap_area = st.number_input("Panel area (m²)", min_value=1.0, value=250000.0)
 
-            st.markdown("**Grid**")
-            grid_export_limit = st.number_input("Grid export limit (MW)", min_value=0.1, value=cap_ac)
+                st.markdown("**Grid**")
+                grid_export_limit = st.number_input("Grid export limit (MW)", min_value=0.1, value=cap_ac)
 
-            st.markdown("**Equipment**")
-            equip_cod = st.date_input("Commercial operation date")
-            equip_module = st.text_input("Module type", placeholder="Mono PERC 540Wp")
-            equip_inverters = st.number_input("Inverter count", min_value=1, value=10, step=1)
+                st.markdown("**Equipment**")
+                equip_cod = st.date_input("Commercial operation date")
+                equip_module = st.text_input("Module type", placeholder="Mono PERC 540Wp")
+                equip_inverters = st.number_input("Inverter count", min_value=1, value=10, step=1)
 
-            st.markdown("**Regulatory**")
-            seller_category_options = sorted(_dsm.SELLER_CATEGORIES)
-            reg_category = st.selectbox(
-                "Seller category", seller_category_options,
-                index=seller_category_options.index("solar") if "solar" in seller_category_options else 0,
-            )
-            include_contract_rate = st.checkbox("Specify contract rate")
-            reg_contract_rate = (
-                st.number_input("Contract rate (Rs/kWh)", min_value=0.01, value=2.50)
-                if include_contract_rate else None
-            )
-            reg_transaction_type = st.selectbox(
-                "Transaction type", ["(not specified)"] + sorted(_grid_code.KNOWN_TRANSACTION_TYPES)
-            )
+                st.markdown("**Regulatory**")
+                seller_category_options = sorted(_dsm.SELLER_CATEGORIES)
+                reg_category = st.selectbox(
+                    "Seller category", seller_category_options,
+                    index=seller_category_options.index("solar") if "solar" in seller_category_options else 0,
+                )
+                include_contract_rate = st.checkbox("Specify contract rate")
+                reg_contract_rate = (
+                    st.number_input("Contract rate (Rs/kWh)", min_value=0.01, value=2.50)
+                    if include_contract_rate else None
+                )
+                reg_transaction_type = st.selectbox(
+                    "Transaction type", ["(not specified)"] + sorted(_grid_code.KNOWN_TRANSACTION_TYPES)
+                )
 
-            submitted = st.form_submit_button("Register plant")
-            if submitted:
-                location = {
-                    "name": loc_name, "state": loc_state,
-                    "latitude": loc_lat, "longitude": loc_lon, "timezone": loc_tz,
-                }
-                if loc_elevation is not None:
-                    location["elevation_m"] = loc_elevation
-                capacity = {
-                    "ac_capacity_mw": cap_ac, "dc_capacity_mw": cap_dc,
-                    "panel_efficiency": cap_eff, "temperature_coefficient": cap_temp_coef,
-                    "performance_ratio": cap_pr, "panel_area_m2": cap_area,
-                }
-                grid = {"export_limit_mw": grid_export_limit}
-                equipment = {
-                    "commercial_operation_date": equip_cod.isoformat(),
-                    "module_type": equip_module, "inverter_count": int(equip_inverters),
-                }
-                regulatory = {"seller_category": reg_category}
-                if reg_contract_rate is not None:
-                    regulatory["contract_rate_rs_per_kwh"] = reg_contract_rate
-                if reg_transaction_type != "(not specified)":
-                    regulatory["transaction_type"] = reg_transaction_type
+                submitted = st.form_submit_button("Register plant")
+                if submitted:
+                    location = {
+                        "name": loc_name, "state": loc_state,
+                        "latitude": loc_lat, "longitude": loc_lon, "timezone": loc_tz,
+                    }
+                    if loc_elevation is not None:
+                        location["elevation_m"] = loc_elevation
+                    capacity = {
+                        "ac_capacity_mw": cap_ac, "dc_capacity_mw": cap_dc,
+                        "panel_efficiency": cap_eff, "temperature_coefficient": cap_temp_coef,
+                        "performance_ratio": cap_pr, "panel_area_m2": cap_area,
+                    }
+                    grid = {"export_limit_mw": grid_export_limit}
+                    equipment = {
+                        "commercial_operation_date": equip_cod.isoformat(),
+                        "module_type": equip_module, "inverter_count": int(equip_inverters),
+                    }
+                    regulatory = {"seller_category": reg_category}
+                    if reg_contract_rate is not None:
+                        regulatory["contract_rate_rs_per_kwh"] = reg_contract_rate
+                    if reg_transaction_type != "(not specified)":
+                        regulatory["transaction_type"] = reg_transaction_type
 
-                try:
-                    register_plant(
-                        plant_id=new_plant_id, name=new_name, location=location,
-                        capacity=capacity, grid=grid, equipment=equipment,
-                        regulatory=regulatory,
-                    )
-                except (PlantAlreadyRegisteredError, ValueError) as e:
-                    st.error(str(e))
-                else:
-                    st.success(f"Plant {new_plant_id!r} registered.")
-                    st.rerun()
+                    try:
+                        register_plant(
+                            plant_id=new_plant_id, name=new_name, location=location,
+                            capacity=capacity, grid=grid, equipment=equipment,
+                            regulatory=regulatory,
+                        )
+                    except (PlantAlreadyRegisteredError, ValueError) as e:
+                        st.error(str(e))
+                    else:
+                        st.success(f"Plant {new_plant_id!r} registered.")
+                        st.rerun()
 
 PLANT = get_plant_config(selected_plant_id)
 PLANT_CAPACITY_MW = PLANT["capacity"]["ac_capacity_mw"]
