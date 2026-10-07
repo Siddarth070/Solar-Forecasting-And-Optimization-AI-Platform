@@ -64,6 +64,48 @@ this yet. The model previously reported here (an unrelated, now-removed
 2.17% MAPE figure) suffered from target leakage and is not comparable to
 the number above — see `git log` for the fix.
 
+### First real-data check (non-Indian, research-only — not P3.1)
+
+Every number above is synthetic. `validate_real_data_nrel_pvdaq.py` runs
+this project's P0.4 baselines and P2.2 quality gate against **real**
+measured generation data for the first time — NREL PVDAQ system 9068
+("SR_CO"), a public research plant in Kersey, Colorado (single-axis
+tracker, CdTe, 4.738 MW DC, ~6.2 years of 5-minute revenue-grade
+metering). Data: [DOI:10.25984/1846021](https://dx.doi.org/10.25984/1846021),
+© 2024 Alliance for Sustainable Energy, LLC, BSD-3-Clause-style license.
+
+**This is explicitly not roadmap P3.1** — wrong country (no CERC/IEGC
+relevance), wrong technology (this project's physics baseline assumes a
+fixed-tilt plant; this one is a tracker), and several plant facts
+(AC capacity, performance ratio) are fitted from the data itself rather
+than read from a nameplate spec, since the public dataset doesn't give
+them — see the script's own output for exactly which numbers are real
+vs. inferred.
+
+What it actually found, for real:
+- The quality gate (P2.2), pointed at real data for the first time,
+  correctly flagged 40 above-capacity blocks, 111 night-time-non-zero
+  blocks, and 68 timestamp gaps — real messiness a synthetic simulator
+  never produces, caught by code that had only ever seen clean data.
+- A genuine bug in `smart_persistence_baseline`: a near-zero (not exactly
+  zero) clear-sky-power denominator at dawn/dusk — common in real sensor
+  data, never produced by the synthetic simulator — blew up one day's
+  prediction to 715 MW for a ~4 MW plant (nRMSE 150%). Fixed by bounding
+  the ratio to the same `[0, 1.3]` range this project's own
+  `clear_sky_index` already uses elsewhere; nRMSE dropped to 31.6%,
+  in line with plain persistence. Regression test:
+  `tests/test_baselines.py::TestSmartPersistenceBaseline::test_near_zero_clear_sky_power_does_not_blow_up`.
+- Baseline scores on the real 6.2-year history: persistence nMAE 21.6%,
+  smart persistence 23.2%, physics 35.7% — all an order of magnitude
+  worse than the synthetic numbers above, exactly as expected for a
+  harder real plant with real sensor noise, gaps, and a technology this
+  project's methods weren't tuned for. Not a result to market; a sign the
+  harness behaves honestly on real difficulty instead of silently
+  inflating.
+
+The raw data isn't vendored in this repo (~380 MB); the script's own
+docstring gives the exact download commands to reproduce this.
+
 ---
 
 ## Architecture
@@ -201,8 +243,226 @@ any new feature work. As of this commit:
   `/schedule/revise` already used. **Not done:** a numeric revision-count
   cap for WS sellers specifically (none of the source documents specify
   one; see `grid_code.py`'s docstring).
-- **Not started:** real customer-file ingestion, loss attribution, and
-  any real-plant validation — Phase 2 onward.
+- **Phase 2, started:** a data-quality gate (`src/quality/gate.py`,
+  `POST /quality/check`) that runs before any forecast is shown — per
+  the roadmap's own framing, "the customer sees a quality report before
+  they see a forecast." It checks ingested generation readings for a
+  missing timezone, duplicate timestamps, timestamp gaps (nominal
+  resolution inferred as the mode of consecutive deltas, robust to a few
+  genuine gaps), negative power, above-rated-capacity readings, flatlines
+  (a non-zero value repeated for >= 4 consecutive blocks — a likely stuck
+  inverter, distinct from the normal run of identical zero readings every
+  night), and generation reported while the sun is below the horizon at
+  the plant's real location (`pvlib`'s clear-sky model, using each
+  plant's actual lat/lon from `configs/plants/`). Each check reports a
+  severity (error = unsafe to forecast on, warning = usable but noted),
+  a count, and the specific timestamps — never a bare pass/fail. Tested
+  with 14 unit tests (one engineered problem per test, checked not to
+  accidentally trip a second check) plus 5 end-to-end API tests.
+  A loss attribution engine (`src/attribution/loss.py`, `POST
+  /losses/attribute`) that compares actual generation against
+  expected-from-irradiance — reusing the exact PV physics formula
+  `src/ingestion/jaipur_simulator.py` uses to generate this project's own
+  training data (GHI × temperature-derated performance ratio × capacity),
+  just parameterized by each plant's own config instead of that
+  simulator's hardcoded constants — and classifies each block's material
+  residual loss into a cause with the evidence that produced it: weather
+  (a clear-sky-index ramp consistent with a passing cloud), equipment
+  (a sustained, irradiance-uncorrelated drop that still tracks the
+  underlying solar ramp's shape), curtailment (a hard flat output clip
+  while expected output keeps varying), or unknown (material loss with
+  no supporting pattern). A separate day-level check
+  (`daily_performance_ratio()` / `detect_soiling()`) flags a slow,
+  sustained decline in the daily actual/expected ratio over 10+ days as
+  suspected soiling — a trend invisible at single-block granularity.
+  Every classification carries a confidence label and the raw numbers
+  behind it, never a bare label. Tested with 12 unit tests (one
+  hand-computed loss scenario per cause, with exact expected MW values
+  worked out by hand, not just "it ran") plus 6 end-to-end API tests.
+  **Honestly limited, not fabricated:** this platform has no
+  per-inverter/string telemetry and no real grid curtailment-instruction
+  feed, so "equipment" and "curtailment" are always reported as
+  suspected/possible — the module's own docstring and every such block's
+  evidence text say so explicitly, never claiming a confirmed asset or a
+  confirmed grid order.
+  A schedule-risk scorer (`src/risk/schedule_risk.py`, `POST
+  /schedule/risk`) that runs each block's P10/P50/P90 forecast through
+  the real CERC DSM settlement math (`src/regulatory/dsm.py`, roadmap
+  P1.7) against the declared schedule and reports which Note-1
+  volume-limit band each quantile's deviation reaches — reusing
+  `deviation_settlement()`'s own segment widths to determine the band
+  rather than re-deriving separate cutoffs, so the band can never
+  disagree with the Rs figure reported alongside it. A block's risk
+  level (low/medium/high) is driven by the WORST band any of the three
+  quantiles reaches, so a calm median with a wide, risky tail is still
+  flagged — not just the point forecast. Correctly reads the real
+  01.04.2026 DSM cutover date (`as_of`), tightening the bands
+  post-cutover exactly as Regulation 8(4) Note-1 specifies. Per the
+  roadmap, every block AND the report itself carry the disclaimer
+  verbatim: "Indicative DSM exposure based on configured assumptions and
+  uploaded data. Not an official settlement statement." Has no flat-
+  penalty fallback (unlike `/optimize`) — a plant missing
+  `regulatory.seller_category`/`contract_rate_rs_per_kwh` gets a clear
+  422, not a silent, meaningless estimate. Tested with 7 unit tests
+  (hand-computed deviation MWh and band per scenario, including a test
+  proving the same deviation reads a stricter band after the cutover
+  date) plus 7 end-to-end API tests.
+  An operator-recommendation engine (`src/recommendations/engine.py` +
+  `store.py`, `POST /recommendations/generate`, `GET /recommendations`,
+  `POST /recommendations/{id}/decide`) that turns the already-computed
+  P2.4/P2.5 evidence into concrete suggestions — per the roadmap,
+  **human-approved only, never automatic control**: nothing in this
+  engine writes to a schedule, a battery, or anything else by itself.
+  Three rules: a schedule-revision suggestion for each HIGH-risk block
+  whose real Grid Code revision gate (`src/regulatory/grid_code.py`,
+  roadmap P1.4) is still open — skipped outright, not just gated, for a
+  plant whose configured transaction structure isn't revision-eligible
+  at all (Regulation 49(8)); a battery charge/discharge suggestion for
+  each MEDIUM/HIGH-risk block the plant's actual battery headroom can
+  (even partially) offset, explicitly marked "partial" when it can't
+  fully cover the deviation; and one inspection suggestion per
+  suspected-equipment RUN (grouped by that run's own start timestamp, so
+  one physical fault produces one suggestion, not one per 15-minute
+  block). Every suggestion carries its trigger and the raw evidence that
+  produced it. Approve/dismiss decisions are logged to an append-only
+  SQLite log (`src/recommendations/store.py`) — chosen because this
+  platform has no real database yet (that's roadmap P2.11, a separate
+  architecture decision) and an in-memory log would lose the audit trail
+  on every restart; a later decision can override an earlier one's
+  status without erasing it from the log. Tested with 13 unit tests for
+  the three rules plus 10 for the log (including that a nonexistent
+  recommendation, an unattributed decision, and an invalid decision
+  value all fail loudly) plus 10 end-to-end API tests.
+  A weekly forecast-performance report (`src/reporting/weekly_report.py`,
+  `POST /reports/weekly`) that scores forecasts that were ACTUALLY
+  SERVED, once the real outcome is known, by lead time (horizon) and time
+  of day (block) — exactly where a forecast tends to be weakest — against
+  the same three untrained baselines (persistence, smart_persistence,
+  physics) `benchmark.py` already used for training-time evaluation.
+  Those baselines were factored out into `src/evaluation/baselines.py`
+  first, so `benchmark.py` and this new production report use identical
+  math, not two implementations that could quietly drift apart. Reports
+  a `beats_baseline` verdict per baseline (model nMAE below that
+  baseline's, computed, never assumed) alongside the raw numbers. Per the
+  roadmap, "contains no number that cannot be traced to raw data" —
+  every figure is a direct nMAE/nRMSE off the actual/predicted pairs
+  given; nothing is estimated. Rejects a request whose forecasts aren't
+  fully covered by the supplied readings (a report cannot honestly score
+  an outcome it wasn't given) with a clear 422. Tested with 9 unit tests
+  for the shared baselines (`tests/test_baselines.py`) plus 7 for the
+  report itself — every nMAE hand-computed from a small, fully
+  deterministic dataset (a constant clear-sky index so the physics
+  baseline is a known constant, and two different constant-actual days so
+  persistence/smart_persistence carry an exact, known error) — plus 5
+  end-to-end API tests.
+  A self-serve plant onboarding flow (`src/onboarding/plant_registration.py`,
+  `POST /plants`, `GET /plants/{plant_id}`, plus a matching form in the
+  Streamlit dashboard — roadmap P2.3) that writes a brand-new
+  `configs/plants/<plant_id>.yaml` directly, the same file every other
+  endpoint already reads via `get_plant_config()`, so a freshly onboarded
+  plant is live for every existing endpoint immediately, with no restart
+  and no code change — proven end-to-end in tests by onboarding a plant
+  and calling `POST /quality/check` and `POST /schedule/risk` against it
+  in the same test, and manually in the dashboard by onboarding a plant
+  through the real form and watching it appear in the plant selector.
+  Captures everything roadmap P1.1's schema holds plus the four fields
+  P2.3 adds: commercial operation date, module type, inverter count, and
+  a grid export-limit cap (`grid.export_limit_mw`, finally giving the
+  previously 100%-dormant `grid` block a real field) — the export limit
+  is **enforced**, not just stored: `POST /optimize` now caps dispatch at
+  it via a new curtailment mechanism in
+  `src/optimization/battery_optimizer.py` (a `curtail` variable, active
+  only when a limit is configured, so every existing caller that doesn't
+  set one gets an identical LP with zero behavior change). Deliberately
+  does **not** depend on roadmap P2.1 (CSV/Excel historical data upload,
+  not yet built) — this is plant *configuration* onboarding only, not
+  historical *data* ingestion, a separate concern P2.1 still owns.
+  Create-only (409 on a duplicate `plant_id`, no update/edit path —
+  `get_plant_config()`'s `@lru_cache` makes a safe in-place edit a
+  separate piece of future work). `plant_id` is defended against path
+  traversal two ways — a strict allowlist regex and an independent
+  resolved-path containment check — applied to BOTH the new write path
+  and a **pre-existing path-traversal bug found while building this**:
+  `get_plant_config()` used to build its file path as
+  `PLANTS_DIR / f"{plant_id}.yaml"` with no validation at all, and
+  `pathlib`'s `/` operator silently discards the left operand when the
+  right side is itself an absolute path, so `plant_id="/etc/passwd"`
+  resolved to `Path("/etc/passwd.yaml")`, not anything under
+  `configs/plants/` — every existing `plant_id`-accepting endpoint was
+  exposed to this; it's now fixed in `src/utils/config_loader.py` and
+  regression-tested. Tested with 27 unit tests for the pure registration
+  logic, 18 end-to-end API tests, 6 tests for the path-traversal fix
+  (`tests/test_config_loader.py`) plus a regression test through an
+  actual existing endpoint, and 4 tests for export-limit enforcement in
+  the optimizer.
+- **Not started:** real customer-file ingestion (P2.1) and any
+  real-plant validation — rest of Phase 2 onward.
+
+### Phase 3 (shadow pilot) — P3.2 engine built ahead of P3.1
+
+Phase 3 is structurally gated on P3.1 — securing one real plant's
+historical dataset — which is **not done**: as of this writing, zero
+plants have agreed to share data, and the outreach to prospective
+contacts (drafted, not fabricated — six named people plus NSEFI, each
+tied to a real, independently verified source) hasn't been sent yet.
+Nothing below is a real P3.2 result; it's the pipeline that runs one
+the moment real data lands.
+
+- `src/evaluation/shadow_backtest.py` — given a plant-supplied CSV of
+  real historical AC export readings (`timestamp`, `power_mw` — exactly
+  the two columns the P3.1 data request asks for), this:
+  1. Runs the existing P2.2 data-quality gate first (`src/quality/gate.py`)
+     and refuses to backtest on data that fails it, per that module's own
+     rule: "the customer sees a quality report before they see a forecast."
+  2. Fetches **real** historical weather for the plant's own location and
+     exact date range from the Open-Meteo archive API — the same source
+     `src/ingestion/open_meteo_fetcher.py` already uses for the live
+     forecast path — so the plant only has to supply its own export data,
+     never weather.
+  3. Builds features with the existing `src/features/pipeline.py` and
+     scores the served model (if supplied) and all three P0.4 baselines
+     (`src/evaluation/baselines.py`: persistence, smart_persistence,
+     physics) against the real actuals, using the exact same nMAE/nRMSE
+     convention as `benchmark.py`'s rolling-origin backtest and final
+     holdout — this is what P3.2's acceptance criterion ("rolling-origin
+     results... with the baselines from P0.4 shown alongside") actually
+     asks for.
+- Tested end-to-end in `tests/test_shadow_backtest.py` (10 tests) against
+  **synthetic fixtures only**, with the weather fetch always mocked —
+  every test says explicitly it's a dry run proving the plumbing works,
+  not a real result. Covers: CSV schema validation (missing column,
+  mixed tz-aware/naive timestamps, non-numeric power, duplicate
+  timestamps), the data-quality gate blocking a bad file before any
+  network call happens, and the full pass-through path with and without
+  a served model.
+- `src/evaluation/attribution_validation.py` — the P3.4 engine, built the
+  same way: `src/attribution/loss.py` (P2.4) already labels "equipment"
+  and "curtailment" as SUSPECTED/POSSIBLE, by its own docstring, because
+  this platform has no per-inverter telemetry and no real grid
+  curtailment-order feed. This module checks those two labels against a
+  plant-supplied O&M log (`start_timestamp`, `end_timestamp`,
+  `event_type` — again exactly the "outage notes" the P3.1 data request
+  already asks for) and reports precision/recall per class, which is
+  P3.4's acceptance criterion verbatim. "weather" and "unknown" aren't
+  scored against the log — there's no O&M ground truth for weather, and
+  scoring "unknown" against a log would just be checking whether the
+  model's own honest shrug happened to coincide with a logged event,
+  which isn't a useful question.
+- Tested in `tests/test_attribution_validation.py` (9 tests), all
+  against a synthetic generation series fed through the REAL
+  `attribute_losses()` (so the predicted causes are genuinely computed,
+  not hand-set) and a synthetic O&M log. Covers: log schema validation
+  (missing column, tz-naive timestamps, mixed timezones within a
+  column, an unrecognised event type being dropped rather than
+  miscoded), a log that matches the injected pattern scoring high
+  precision/recall, a log with zero time overlap scoring nothing
+  (`NaN`, not a fabricated zero), and a deliberately wrong log entry
+  correctly showing up as a false positive.
+- **Not started:** everything that needs a real plant's data to even
+  attempt — P3.2's actual run, P3.3 (signed-off accuracy report), P3.4's
+  actual run, P3.5 (case study). Outreach for P3.1 went out 2026-10-01
+  to seven targets (six named contacts plus NSEFI); as of this writing,
+  no replies yet.
 
 ## API Endpoints
 
@@ -279,6 +539,81 @@ Browser access is restricted to the origins in `CORS_ALLOW_ORIGINS`
 - Everything is trained and validated on simulated data for one plant in
   one location — no real-plant or multi-season (beyond a synthetic full
   year) validation exists yet.
+- The data-quality gate (`src/quality/gate.py`) cannot detect a
+  mislabeled timezone by inference (e.g. data secretly in UTC but claiming
+  to be IST) — that needs a real ground truth to compare against. Its
+  `night_time_non_zero` check catches the common ~5:30h UTC/IST offset
+  error as a side effect (real solar position at the claimed timestamp
+  would show the sun down while data reports generation), but a
+  wrongly-labeled timezone with a smaller offset would not necessarily
+  trip it. It has also only been exercised on synthetic data — no real
+  customer file, with real logger dropouts and re-export duplicates, has
+  been run through it yet.
+- The loss attribution engine (`src/attribution/loss.py`) works from one
+  plant-level aggregate power reading and a single site-wide GHI/
+  temperature pair — it has no per-inverter or per-string telemetry, so
+  it can never confirm WHICH asset caused an "equipment" loss, only that
+  the aggregate pattern looks like one. It also has no real grid
+  curtailment-instruction feed (SLDC/RLDC order log), so a hard flat clip
+  is reported as "possible curtailment", never a confirmed grid-ordered
+  one — that confirmation needs a real QCA/grid-operator integration
+  (roadmap P2.7/P2.8, both explicitly deferred pending a real
+  counterparty). The soiling check needs 10+ real calendar days of
+  readings to fit a trend on; it has only been exercised on synthetic
+  multi-day scenarios, not a real degrading plant.
+- The schedule-risk scorer (`src/risk/schedule_risk.py`) inherits, not
+  duplicates, `src/regulatory/dsm.py`'s own two documented gaps: its Rs
+  figures use the illustrative `contract_rate_rs_per_kwh` placeholder
+  (not a real PPA tariff), and its post-01.04.2026 classification uses
+  the same explicitly-labeled Available-Capacity-only fallback for the
+  unpublished blend-weight "X". It also has no automatic upsampling from
+  `/forecast`'s hourly P10/P50/P90 output onto the 96-block grid this
+  endpoint expects (the same gap already noted for `/forecast` above) —
+  a caller must resample first, e.g. via `src.time_blocks.
+  integrate_to_blocks`.
+- The operator-recommendation log (`src/recommendations/store.py`) is a
+  single SQLite file on the API server's own disk, not a shared,
+  multi-instance-safe database — fine for one server process (this
+  platform's current deployment shape), but it would need a real
+  database (roadmap P2.11) before running behind more than one API
+  instance. The recommendation rules themselves only see what's already
+  in a P2.4/P2.5 report, so they inherit every gap already documented
+  for those: no per-inverter telemetry behind an "inspection"
+  suggestion, no real grid curtailment feed, and the illustrative
+  contract-rate placeholder behind a schedule-revision suggestion's Rs
+  figures. Nothing here has been exercised against a real operator's
+  actual workflow — only synthetic trigger scenarios.
+- `POST /reports/weekly` (roadmap P2.9) has no forecast log to draw
+  on — `POST /forecast` doesn't persist what it returns anywhere, so a
+  caller must supply the served forecasts and their now-known actual
+  outcomes itself. This module has only been exercised on synthetic
+  data; wiring a real forecast log (so this report could genuinely run
+  unattended on a weekly cadence against live history) is future work,
+  as is the scheduler/cron layer itself — "generated unattended" here
+  describes the scoring math (deterministic, no human judgment calls),
+  not an actual deployed schedule.
+- Plant onboarding (`POST /plants`, roadmap P2.3) is **create-only** —
+  there is no way to edit or update an already-registered plant's config
+  through the API or the dashboard form. `configs/plants/*.yaml` can
+  still be hand-edited on disk as before, but `get_plant_config()`'s
+  `@lru_cache` means a running server won't see a hand-edit until its
+  cache is cleared or it restarts — a real update endpoint needs a real
+  cache-invalidation story this task didn't build. There is also no
+  authentication or multi-tenancy anywhere (this platform remains
+  explicitly single-tenant — roadmap P2.11's multi-tenant rewrite depends
+  on P2.3 finishing first, not the other way around) — anyone who can
+  reach the API or the dashboard can register a plant. Onboarding a
+  plant's *configuration* is entirely separate from roadmap P2.1 (real
+  customer CSV/Excel data upload), which remains not started — a freshly
+  onboarded plant has zero historical generation data of its own until
+  P2.1 exists or a caller supplies readings directly. Onboarding-generated
+  YAML files don't carry the hand-written inline comments the two demo
+  files (`jaipur_100mw.yaml`, `pune_50mw.yaml`) have (`yaml.safe_dump`
+  doesn't preserve/produce them) — a cosmetic difference, not a data-loss
+  concern. `grid.sldc`/`rldc`/`ists_or_instate`/`qca_role`/`metering_point`
+  and `regulatory.schedule_format` remain permanently `null` for every
+  onboarded plant — not exposed as onboarding inputs at all, since zero
+  code reads any of them today.
 
 ---
 

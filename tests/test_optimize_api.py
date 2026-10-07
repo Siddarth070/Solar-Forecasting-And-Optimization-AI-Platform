@@ -95,3 +95,30 @@ class TestOptimizeWithDate:
             "plant_id": "does_not_exist",
         })
         assert resp.status_code == 404
+
+    def test_plant_with_export_limit_gets_curtailment_enforced_end_to_end(self, client, monkeypatch):
+        # Roadmap P2.3: grid.export_limit_mw, once configured, must be
+        # enforced by /optimize -- not just stored.
+        import src.api.main as main_module
+
+        def fake_get_plant_config(plant_id):
+            return {
+                "plant_id": plant_id,
+                "capacity": {"ac_capacity_mw": 100},
+                "grid": {"export_limit_mw": 20.0},
+                "regulatory": {},
+            }
+
+        monkeypatch.setattr(main_module, "get_plant_config", fake_get_plant_config)
+        resp = client.post("/optimize", json={
+            "solar_forecast_mw": [80.0],
+            "declared_schedule_mw": [10.0],
+            "plant_id": "capped_plant",
+            "battery_capacity_mwh": 20, "charge_rate_mw": 5, "discharge_rate_mw": 5,
+            "initial_charge_mwh": 10, "dt_hours": 1.0, "round_trip_efficiency": 1.0,
+        })
+        assert resp.status_code == 200
+        record = resp.json()["schedule"][0]
+        grid_delivered = record["solar_mw"] - record["curtailed_mw"] + record["discharge_mw"] - record["charge_mw"]
+        assert grid_delivered <= 20.0 + 1e-6
+        assert record["curtailed_mw"] > 0

@@ -50,6 +50,13 @@ from xgboost import XGBRegressor
 PROJECT_ROOT = Path(__file__).resolve().parent
 sys.path.insert(0, str(PROJECT_ROOT))
 
+from src.evaluation.baselines import (
+    clear_sky_power as _clear_sky_power,
+    nmae_nrmse as _nmae_nrmse,
+    persistence_baseline as _persistence_baseline,
+    physics_baseline as _physics_baseline,
+    smart_persistence_baseline as _smart_persistence_baseline,
+)
 from src.features.pipeline import build_features, SERVING_FEATURE_COLUMNS
 from src.ingestion.jaipur_simulator import generate_jaipur_weather
 from src.ingestion.synthetic_forecast import simulate_day_ahead_forecast
@@ -77,50 +84,17 @@ HOLDOUT_START, HOLDOUT_DAYS, HOLDOUT_SEED = "2025-06-01", 30, 99
 MIN_TRAIN_HOURS = 24 * 30   # at least 30 days of history before the first origin
 ORIGIN_STRIDE_HOURS = 24 * 7  # weekly origins
 FORECAST_HORIZON_HOURS = 24
-LAG_HOURS = 24               # how far back persistence/smart-persistence look
+# LAG_HOURS lives in src.evaluation.baselines now (how far back
+# persistence/smart-persistence look) -- kept in one place, not
+# duplicated here, so it can't drift from what those functions actually use.
 
 BASELINE_NAMES = ["model", "persistence", "smart_persistence", "physics"]
 
-
-def _physics_baseline(features: pd.DataFrame, plant_config: dict) -> pd.Series:
-    """No ML: forecast GHI -> power via the plant's rated conversion only."""
-    plant = plant_config["capacity"]
-    power = (features["shortwave_radiation"] / 1000) * plant["performance_ratio"] * plant["ac_capacity_mw"]
-    return power.clip(lower=0, upper=plant["ac_capacity_mw"])
-
-
-def _clear_sky_power(features: pd.DataFrame, plant_config: dict) -> pd.Series:
-    plant = plant_config["capacity"]
-    return (features["clear_sky_ghi_model"] / 1000) * plant["performance_ratio"] * plant["ac_capacity_mw"]
-
-
-def _persistence_baseline(y: pd.Series) -> pd.Series:
-    """D-1 same block: forecast(t) = actual(t - 24h)."""
-    return y.shift(LAG_HOURS)
-
-
-def _smart_persistence_baseline(y: pd.Series, features: pd.DataFrame, plant_config: dict) -> pd.Series:
-    """Persist YESTERDAY's clear-sky ratio, applied to TODAY's clear-sky
-    estimate. Uses only y(t-24h) and clear_sky_power(t-24h)/(t) -- nothing
-    at or after t, so this is a legitimate forecast, not a leak."""
-    csp = _clear_sky_power(features, plant_config)
-    ratio_yesterday = (y / csp.replace(0, np.nan)).shift(LAG_HOURS)
-    return (csp * ratio_yesterday).clip(lower=0)
-
-
-def _nmae_nrmse(y_true: pd.Series, y_pred: pd.Series, capacity_mw: float,
-                 daytime_mask: pd.Series):
-    """Restricted to daylight hours, for every method equally. Nighttime
-    power is trivially ~0 for any method, so including it would flatter
-    everyone's score by the same amount EXCEPT smart_persistence, whose
-    clear-sky ratio is undefined (0/0) at night and drops out on its own --
-    scoring it against a daytime-only mask that every other method also
-    uses keeps the comparison apples-to-apples."""
-    mask = y_true.notna() & y_pred.notna() & daytime_mask
-    err = y_true[mask] - y_pred[mask]
-    mae = err.abs().mean()
-    rmse = np.sqrt((err ** 2).mean())
-    return 100 * mae / capacity_mw, 100 * rmse / capacity_mw, int(mask.sum())
+# _physics_baseline, _clear_sky_power, _persistence_baseline,
+# _smart_persistence_baseline and _nmae_nrmse now live in
+# src/evaluation/baselines.py (imported above), so roadmap P2.9's weekly
+# production report scores against the exact same baseline math, not a
+# separate implementation that could quietly drift from this one.
 
 
 def _fresh_model() -> XGBRegressor:
