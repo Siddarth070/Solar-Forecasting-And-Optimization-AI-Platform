@@ -12,14 +12,55 @@ from xgboost import XGBRegressor
 PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent
 sys.path.insert(0, str(PROJECT_ROOT))
 
+from src.attribution.loss import attribute_losses, daily_performance_ratio, detect_soiling
 from src.features.pipeline import build_features, SERVING_FEATURE_COLUMNS
+from src.onboarding.plant_registration import PlantAlreadyRegisteredError, register_plant
 from src.optimization.battery_optimizer import BatteryOptimizer
+from src.quality.gate import run_quality_checks
+from src.recommendations import store as recommendations_store
+from src.recommendations.engine import (
+    recommend_battery_actions,
+    recommend_inspections,
+    recommend_schedule_revisions,
+)
 from src.regulatory import grid_code
+from src.reporting.weekly_report import generate_weekly_report
+from src.risk.schedule_risk import score_schedule_risk
 from src.scheduling.rolling_horizon import apply_schedule_revision
 from src.time_blocks import BLOCKS_PER_DAY, block_boundaries
 from src.utils.config_loader import get_plant_config, list_plant_ids
 
 DEFAULT_PLANT_ID = "jaipur_100mw"
+
+
+def get_recommendations_db():
+    """A fresh connection to the recommendation log (roadmap P2.6) on
+    every call -- SQLite handles this cheaply, and it keeps request
+    handling stateless. Tests override this (see
+    tests/test_recommendations_api.py) to point at one shared in-memory
+    connection instead of the real on-disk log."""
+    return recommendations_store.connect()
+
+
+def build_timestamp_index(raw_timestamps: list[str]) -> pd.DatetimeIndex:
+    """Parse ISO timestamp strings into one consistent, homogeneous
+    DatetimeIndex. Raises ValueError -- meant to be caught and turned
+    into a 422 -- if they can't form one, e.g. a mix of tz-aware and
+    tz-naive timestamps (pandas can't unify those into a single
+    DatetimeIndex at all, and would otherwise surface as a confusing
+    internal pandas error). Endpoints that need already-clean timestamps
+    (everything except POST /quality/check, whose entire job is
+    diagnosing exactly this kind of raw-data problem) should use this
+    instead of constructing a DatetimeIndex directly."""
+    idx = pd.Index([pd.Timestamp(t) for t in raw_timestamps])
+    if not isinstance(idx, pd.DatetimeIndex):
+        raise ValueError(
+            "Timestamps could not be parsed into one consistent timezone -- e.g. some "
+            "carry a UTC offset and others don't. Use POST /quality/check first to "
+            "diagnose raw data like this."
+        )
+    return idx
+
 
 # ── App setup ─────────────────────────────────────────────────
 app = FastAPI(
@@ -192,6 +233,228 @@ class ReviseScheduleResponse(BaseModel):
     )
 
 
+class GenerationReading(BaseModel):
+    """One raw generation reading to be quality-checked (roadmap P2.2)."""
+    timestamp: str = Field(..., description="ISO8601 timestamp, e.g. '2024-06-01T09:00:00+05:30'.")
+    power_mw: float = Field(..., description="Reported generation in MW -- not clamped or "
+                                              "validated here; that's exactly what this endpoint checks.")
+
+
+class QualityCheckRequest(BaseModel):
+    """Request body for the data-quality gate (roadmap P2.2)."""
+    plant_id: str = Field(default=DEFAULT_PLANT_ID)
+    readings: list[GenerationReading] = Field(..., min_length=1)
+
+
+class LossReading(BaseModel):
+    """One raw generation + weather reading for loss attribution (roadmap
+    P2.4). Unlike the quality gate, attribution needs the actual measured
+    irradiance and temperature too -- it classifies losses against
+    expected-from-irradiance, which the plant's power reading alone can't
+    reconstruct."""
+    timestamp: str = Field(..., description="ISO8601 timestamp, e.g. '2024-06-01T09:00:00+05:30'.")
+    power_mw: float = Field(..., description="Reported generation in MW.")
+    ghi_w_m2: float = Field(..., description="Measured global horizontal irradiance, W/m^2.")
+    temperature_c: float = Field(..., description="Measured ambient temperature, degC.")
+
+
+class LossAttributionRequest(BaseModel):
+    """Request body for the loss attribution engine (roadmap P2.4)."""
+    plant_id: str = Field(default=DEFAULT_PLANT_ID)
+    readings: list[LossReading] = Field(..., min_length=1)
+
+
+class ScheduleRiskRequest(BaseModel):
+    """Request body for the schedule-risk scoring endpoint (roadmap P2.5)."""
+    plant_id: str = Field(
+        default=DEFAULT_PLANT_ID,
+        description="Must have regulatory.seller_category and "
+                     "regulatory.contract_rate_rs_per_kwh configured -- unlike "
+                     "/optimize, this endpoint has no flat-penalty fallback, "
+                     "since a risk score without the real DSM settlement math "
+                     "behind it would not mean anything."
+    )
+    declared_schedule_mw: list[float] = Field(..., min_length=1)
+    p10_mw: list[float] = Field(..., min_length=1)
+    p50_mw: list[float] = Field(..., min_length=1)
+    p90_mw: list[float] = Field(..., min_length=1)
+    dt_hours: float = Field(default=0.25, description="Block duration in hours")
+    as_of: str | None = Field(
+        default=None,
+        description="Calendar date (YYYY-MM-DD) deciding which side of the CERC DSM "
+                     "01.04.2026 cutover applies (roadmap P1.7). Defaults to `date` if "
+                     "given, else today."
+    )
+    date: str | None = Field(
+        default=None,
+        description="Calendar date (YYYY-MM-DD) this schedule covers (roadmap P1.4). If "
+                     f"given, all four *_mw lists MUST have exactly {BLOCKS_PER_DAY} "
+                     "entries -- one per real 15-minute block of that date -- dt_hours is "
+                     "fixed at 0.25, and the response carries real block-start timestamps."
+    )
+
+
+class BatteryStateInput(BaseModel):
+    """Current battery state, for the battery-action recommendation rule
+    (roadmap P2.6). Omit entirely to skip that rule (no battery
+    configured for this plant) rather than guessing specs."""
+    soc_mwh: float = Field(..., description="Current state of charge, MWh.")
+    capacity_mwh: float = Field(..., description="Usable battery capacity, MWh.")
+    charge_rate_mw: float = Field(..., description="Maximum charge rate, MW.")
+    discharge_rate_mw: float = Field(..., description="Maximum discharge rate, MW.")
+
+
+class ScheduleRiskInputs(BaseModel):
+    """Same shape as ScheduleRiskRequest, nested here so one
+    /recommendations/generate call can drive both the schedule-revision
+    and battery-action rules, which both need a schedule-risk report."""
+    declared_schedule_mw: list[float] = Field(..., min_length=1)
+    p10_mw: list[float] = Field(..., min_length=1)
+    p50_mw: list[float] = Field(..., min_length=1)
+    p90_mw: list[float] = Field(..., min_length=1)
+    dt_hours: float = Field(default=0.25)
+    as_of: str | None = Field(default=None)
+    date: str | None = Field(default=None)
+
+
+class RecommendationsGenerateRequest(BaseModel):
+    """Request body for the operator-recommendation engine (roadmap
+    P2.6). `schedule_risk` drives the schedule-revision and
+    battery-action rules; `loss_readings` drives the inspection rule.
+    Either or both may be given -- omitting one just skips the rules
+    that need it, rather than erroring."""
+    plant_id: str = Field(default=DEFAULT_PLANT_ID)
+    schedule_risk: ScheduleRiskInputs | None = Field(default=None)
+    loss_readings: list[LossReading] | None = Field(default=None)
+    battery_state: BatteryStateInput | None = Field(default=None)
+    now: str | None = Field(
+        default=None,
+        description="Real 'now' timestamp, for checking whether each high-risk block's "
+                     "revision gate is still open (roadmap P1.4). Without it, schedule-"
+                     "revision recommendations are still produced, but say the gate wasn't "
+                     "checked."
+    )
+
+
+class RecommendationDecisionRequest(BaseModel):
+    """Request body for approving/dismissing a logged recommendation
+    (roadmap P2.6) -- human-approved only, and the decision itself is
+    logged, never silently applied."""
+    decision: str = Field(..., description="'approved' or 'dismissed'.")
+    decided_by: str = Field(..., description="Who made this decision -- required for the audit log.")
+    note: str = Field(default="")
+
+
+class WeeklyReportReading(BaseModel):
+    """One historical weather+actual reading (roadmap P2.9). Must cover
+    every `forecasts[].target_timestamp` AND at least
+    src.evaluation.baselines.LAG_HOURS (24h) before the earliest one --
+    persistence/smart_persistence need that lookback."""
+    timestamp: str = Field(..., description="ISO8601 timestamp, e.g. '2024-06-01T09:00:00+05:30'.")
+    shortwave_radiation: float = Field(..., ge=0, le=1200, description="GHI in W/m^2")
+    cloud_cover: float = Field(..., ge=0, le=100)
+    temperature_2m: float = Field(..., ge=-10, le=60)
+    relative_humidity_2m: float = Field(..., ge=0, le=100)
+    wind_speed_10m: float = Field(..., ge=0, le=50)
+    solar_output_mw: float = Field(..., description="Actual generation -- the now-known outcome.")
+
+
+class ServedForecastRecord(BaseModel):
+    """One forecast that was actually served, now scoreable against a
+    known outcome (roadmap P2.9)."""
+    target_timestamp: str = Field(..., description="Which timestamp this forecast was FOR.")
+    horizon_hours: int = Field(..., description="How far ahead the forecast was made, e.g. 1, 6, 24.")
+    predicted_mw: float
+
+
+class WeeklyReportRequest(BaseModel):
+    """Request body for the weekly forecast-performance report (roadmap
+    P2.9)."""
+    plant_id: str = Field(default=DEFAULT_PLANT_ID)
+    readings: list[WeeklyReportReading] = Field(..., min_length=1)
+    forecasts: list[ServedForecastRecord] = Field(..., min_length=1)
+
+
+class PlantLocationInput(BaseModel):
+    """Location block for onboarding a new plant (roadmap P2.3) --
+    mirrors configs/plants/<id>.yaml's `location` block."""
+    name: str = Field(..., min_length=1, max_length=200)
+    state: str = Field(..., min_length=1, max_length=100)
+    latitude: float = Field(..., ge=-90, le=90)
+    longitude: float = Field(..., ge=-180, le=180)
+    elevation_m: float | None = Field(
+        default=None, ge=-500, le=9000,
+        description="Optional. If omitted, left out of the stored config "
+                     "entirely (not written as null) -- every existing "
+                     "consumer's `.get('elevation_m', 0.0)` fallback then "
+                     "applies exactly as it does today."
+    )
+    timezone: str = Field(..., description="IANA timezone name, e.g. 'Asia/Kolkata'.")
+
+
+class PlantCapacityInput(BaseModel):
+    ac_capacity_mw: float = Field(..., gt=0, le=10000)
+    dc_capacity_mw: float = Field(..., gt=0, le=10000)
+    panel_efficiency: float = Field(..., gt=0, le=1)
+    temperature_coefficient: float = Field(..., ge=-0.02, le=0)
+    performance_ratio: float = Field(
+        ..., gt=0, le=1,
+        description="Required, never defaulted -- src/attribution/loss.py "
+                     "and src/evaluation/baselines.py index this with no "
+                     "fallback."
+    )
+    panel_area_m2: float = Field(..., gt=0)
+
+
+class PlantGridInput(BaseModel):
+    """Only export_limit_mw is captured today -- sldc/rldc/ists_or_instate/
+    qca_role/metering_point remain null (zero code reads them)."""
+    export_limit_mw: float = Field(
+        ..., gt=0, le=10000,
+        description="Contractual/regulatory cap on grid export (MW); may "
+                     "be less than capacity.ac_capacity_mw. Enforced by "
+                     "POST /optimize via a curtailment mechanism."
+    )
+
+
+class PlantEquipmentInput(BaseModel):
+    commercial_operation_date: str = Field(..., description="ISO 8601 date (YYYY-MM-DD).")
+    module_type: str = Field(..., min_length=1, max_length=200)
+    inverter_count: int = Field(..., ge=1, le=100000)
+
+
+class PlantRegulatoryInput(BaseModel):
+    seller_category: str = Field(
+        ..., description="Validated against the real WS-seller categories "
+                          "src/regulatory/dsm.py implements."
+    )
+    contract_rate_rs_per_kwh: float | None = Field(default=None, gt=0)
+    transaction_type: str | None = Field(
+        default=None,
+        description="'bilateral' or 'collective' (CERC IEGC 2023 Reg "
+                    "49(8)). If omitted, left out of the stored config "
+                    "entirely so every existing consumer's documented "
+                    "fallback applies unchanged."
+    )
+
+
+class PlantOnboardingRequest(BaseModel):
+    """POST /plants request body (roadmap P2.3)."""
+    plant_id: str = Field(..., min_length=2, max_length=50)
+    name: str = Field(..., min_length=1, max_length=200)
+    location: PlantLocationInput
+    capacity: PlantCapacityInput
+    grid: PlantGridInput
+    equipment: PlantEquipmentInput
+    regulatory: PlantRegulatoryInput
+
+
+class PlantOnboardingResponse(BaseModel):
+    plant_id: str
+    config_path: str
+    plant_config: dict
+
+
 # ── Endpoints ─────────────────────────────────────────────────
 
 @app.get("/health")
@@ -247,7 +510,7 @@ def forecast(request: ForecastRequest):
         # build_features' cyclical encodings, are derived from the real
         # timestamp rather than supplied separately (so they can never
         # disagree with it).
-        timestamps = pd.DatetimeIndex([pd.Timestamp(h.timestamp) for h in request.hours])
+        timestamps = build_timestamp_index([h.timestamp for h in request.hours])
         raw = pd.DataFrame(
             [{
                 "hour": ts.hour,
@@ -302,6 +565,8 @@ def forecast(request: ForecastRequest):
             predictions_p90_mw  = p90_mw,
         )
 
+    except ValueError as e:
+        raise HTTPException(status_code=422, detail=str(e))
     except Exception as e:
         logger.error(f"Forecast error: {e}")
         raise HTTPException(status_code=500, detail=str(e))
@@ -334,6 +599,7 @@ def optimize(request: OptimizeRequest):
         block_starts = block_boundaries(request.date)[:-1]  # 96 block-start timestamps
 
     dsm_kwargs = {}
+    export_limit_mw = None
     if request.plant_id is not None:
         try:
             plant_config = get_plant_config(request.plant_id)
@@ -352,6 +618,11 @@ def optimize(request: OptimizeRequest):
                 f"plant_id={request.plant_id!r} has no regulatory.contract_rate_rs_per_kwh "
                 f"configured -- falling back to the flat deviation_penalty_per_mwh."
             )
+        # Grid export cap (roadmap P2.3) -- a PHYSICAL constraint on the
+        # interconnection, independent of whether DSM mode is active
+        # above (a commercial concern), so it's read and applied
+        # regardless of dsm_kwargs.
+        export_limit_mw = (plant_config.get("grid") or {}).get("export_limit_mw")
 
     try:
         optimizer = BatteryOptimizer(
@@ -361,6 +632,7 @@ def optimize(request: OptimizeRequest):
             initial_charge_mwh    = request.initial_charge_mwh,
             dt_hours              = 0.25 if block_starts is not None else request.dt_hours,
             round_trip_efficiency = request.round_trip_efficiency,
+            export_limit_mw       = export_limit_mw,
             **dsm_kwargs,
         )
 
@@ -491,3 +763,382 @@ def gate_closures(timestamp: str, plant_id: str = DEFAULT_PLANT_ID):
     except Exception as e:
         logger.error(f"Gate closure lookup error: {e}")
         raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/quality/check")
+def quality_check(request: QualityCheckRequest):
+    """
+    Run the data-quality gate over a plant's raw generation readings
+    (roadmap P2.2) -- "the customer sees a quality report before they see
+    a forecast." Detects timestamp gaps, duplicates, a missing timezone,
+    negative power, values above the plant's AC capacity, flatlines
+    (stuck inverter), and night-time non-zero generation (meter/timezone
+    fault). See src/quality/gate.py for the exact rules and thresholds.
+    """
+    try:
+        plant_config = get_plant_config(request.plant_id)
+    except FileNotFoundError as e:
+        raise HTTPException(status_code=404, detail=str(e))
+
+    try:
+        # A plain pd.Index, not build_timestamp_index -- this endpoint's
+        # entire job is diagnosing raw data problems, including a mix of
+        # tz-aware and tz-naive timestamps, which falls back to a generic
+        # object-dtype Index here (see src/quality/gate.py's
+        # _check_missing_timezone) instead of being rejected outright.
+        timestamps = pd.Index([pd.Timestamp(r.timestamp) for r in request.readings])
+        df = pd.DataFrame(
+            {"solar_output_mw": [r.power_mw for r in request.readings]},
+            index=timestamps,
+        )
+        report = run_quality_checks(df, plant_config)
+        return report.to_dict()
+    except Exception as e:
+        logger.error(f"Quality check error: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/losses/attribute")
+def losses_attribute(request: LossAttributionRequest):
+    """
+    Classify every block with a material generation shortfall against
+    expected-from-irradiance into a cause -- weather, equipment
+    (suspected), curtailment (possible), or unknown -- with the evidence
+    that produced each call (roadmap P2.4). When at least 10 distinct
+    calendar days of readings are supplied, also runs the separate
+    day-level soiling check (a slow, sustained decline in the daily
+    actual/expected ratio -- not visible at single-block granularity).
+
+    See src/attribution/loss.py's module docstring for exactly what
+    "equipment" and "curtailment" here can and cannot confirm: this
+    platform has no per-inverter telemetry and no real grid
+    curtailment-instruction feed, so those two causes are always labelled
+    suspected/possible, never a confirmed asset or a confirmed grid order.
+    """
+    try:
+        plant_config = get_plant_config(request.plant_id)
+    except FileNotFoundError as e:
+        raise HTTPException(status_code=404, detail=str(e))
+
+    try:
+        timestamps = build_timestamp_index([r.timestamp for r in request.readings])
+        df = pd.DataFrame(
+            {
+                "solar_output_mw": [r.power_mw for r in request.readings],
+                "shortwave_radiation": [r.ghi_w_m2 for r in request.readings],
+                "temperature_2m": [r.temperature_c for r in request.readings],
+            },
+            index=timestamps,
+        )
+        report = attribute_losses(df, plant_config)
+        result = report.to_dict()
+
+        daily_ratio = daily_performance_ratio(df, plant_config)
+        soiling = detect_soiling(daily_ratio)
+        result["soiling"] = soiling.to_dict() if soiling is not None else None
+        result["days_observed_for_soiling_check"] = len(daily_ratio)
+
+        return result
+    except ValueError as e:
+        raise HTTPException(status_code=422, detail=str(e))
+    except Exception as e:
+        logger.error(f"Loss attribution error: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/schedule/risk")
+def schedule_risk(request: ScheduleRiskRequest):
+    """
+    Score each block's DSM exposure risk (roadmap P2.5) by running its
+    P10/P50/P90 forecast against the declared schedule through the real
+    CERC DSM settlement math (src/regulatory/dsm.py, roadmap P1.7) and
+    reporting which Note-1 volume-limit band each quantile reaches. See
+    src/risk/schedule_risk.py for exactly how risk levels are derived.
+
+    DISCLAIMER (present on every block and on the report itself): this is
+    an indicative estimate from configured assumptions and uploaded data,
+    not an official settlement statement.
+    """
+    lists = [request.declared_schedule_mw, request.p10_mw, request.p50_mw, request.p90_mw]
+
+    block_starts = None
+    if request.date is not None:
+        if any(len(l) != BLOCKS_PER_DAY for l in lists):
+            raise HTTPException(
+                status_code=422,
+                detail=f"date={request.date!r} given: declared_schedule_mw, p10_mw, p50_mw "
+                       f"and p90_mw must each have exactly {BLOCKS_PER_DAY} entries (one per "
+                       f"real 15-minute block of that date), got {[len(l) for l in lists]}."
+            )
+        block_starts = block_boundaries(request.date)[:-1]
+    elif len({len(l) for l in lists}) != 1:
+        raise HTTPException(
+            status_code=422,
+            detail="declared_schedule_mw, p10_mw, p50_mw and p90_mw must all have the same "
+                   f"length, got {[len(l) for l in lists]}."
+        )
+
+    try:
+        plant_config = get_plant_config(request.plant_id)
+    except FileNotFoundError as e:
+        raise HTTPException(status_code=404, detail=str(e))
+
+    as_of_str = request.as_of or request.date
+    as_of = pd.Timestamp(as_of_str).date() if as_of_str else datetime.now().date()
+    dt_hours = 0.25 if block_starts is not None else request.dt_hours
+
+    try:
+        report = score_schedule_risk(
+            declared_schedule_mw=request.declared_schedule_mw,
+            p10_mw=request.p10_mw,
+            p50_mw=request.p50_mw,
+            p90_mw=request.p90_mw,
+            dt_hours=dt_hours,
+            plant_config=plant_config,
+            as_of=as_of,
+            timestamps=block_starts,
+        )
+    except ValueError as e:
+        raise HTTPException(status_code=422, detail=str(e))
+
+    return report.to_dict()
+
+
+@app.post("/recommendations/generate")
+def recommendations_generate(request: RecommendationsGenerateRequest):
+    """
+    Generate operator recommendations (roadmap P2.6) -- schedule
+    revision and battery action from a schedule-risk report (needs
+    `schedule_risk`), inspection from a loss-attribution report (needs
+    `loss_readings`). Every recommendation is logged to the append-only
+    recommendation log (src/recommendations/store.py) as `pending` and
+    returned; NOTHING here is applied automatically -- an operator must
+    separately call POST /recommendations/{id}/decide.
+    """
+    try:
+        plant_config = get_plant_config(request.plant_id)
+    except FileNotFoundError as e:
+        raise HTTPException(status_code=404, detail=str(e))
+
+    generated = []
+
+    if request.schedule_risk is not None:
+        sr = request.schedule_risk
+        lists = [sr.declared_schedule_mw, sr.p10_mw, sr.p50_mw, sr.p90_mw]
+
+        block_starts = None
+        if sr.date is not None:
+            if any(len(l) != BLOCKS_PER_DAY for l in lists):
+                raise HTTPException(
+                    status_code=422,
+                    detail=f"schedule_risk.date={sr.date!r} given: declared_schedule_mw, p10_mw, "
+                           f"p50_mw and p90_mw must each have exactly {BLOCKS_PER_DAY} entries, "
+                           f"got {[len(l) for l in lists]}."
+                )
+            block_starts = block_boundaries(sr.date)[:-1]
+        elif len({len(l) for l in lists}) != 1:
+            raise HTTPException(
+                status_code=422,
+                detail="schedule_risk's declared_schedule_mw, p10_mw, p50_mw and p90_mw must "
+                       f"all have the same length, got {[len(l) for l in lists]}."
+            )
+
+        as_of_str = sr.as_of or sr.date
+        as_of = pd.Timestamp(as_of_str).date() if as_of_str else datetime.now().date()
+        dt_hours = 0.25 if block_starts is not None else sr.dt_hours
+
+        try:
+            risk_report = score_schedule_risk(
+                declared_schedule_mw=sr.declared_schedule_mw,
+                p10_mw=sr.p10_mw, p50_mw=sr.p50_mw, p90_mw=sr.p90_mw,
+                dt_hours=dt_hours, plant_config=plant_config, as_of=as_of,
+                timestamps=block_starts,
+            )
+        except ValueError as e:
+            raise HTTPException(status_code=422, detail=str(e))
+
+        generated += recommend_schedule_revisions(risk_report, plant_config, now=request.now)
+        battery_state = request.battery_state.model_dump() if request.battery_state is not None else None
+        generated += recommend_battery_actions(risk_report, battery_state, dt_hours)
+
+    if request.loss_readings is not None:
+        try:
+            timestamps = build_timestamp_index([r.timestamp for r in request.loss_readings])
+            loss_df = pd.DataFrame(
+                {
+                    "solar_output_mw": [r.power_mw for r in request.loss_readings],
+                    "shortwave_radiation": [r.ghi_w_m2 for r in request.loss_readings],
+                    "temperature_2m": [r.temperature_c for r in request.loss_readings],
+                },
+                index=timestamps,
+            )
+            loss_report = attribute_losses(loss_df, plant_config)
+        except ValueError as e:
+            raise HTTPException(status_code=422, detail=str(e))
+        except Exception as e:
+            logger.error(f"Recommendation loss-attribution error: {e}")
+            raise HTTPException(status_code=500, detail=str(e))
+
+        generated += recommend_inspections(loss_report)
+
+    conn = get_recommendations_db()
+    logged = []
+    for rec in generated:
+        rec_id = recommendations_store.log_recommendation(
+            conn,
+            plant_id=request.plant_id,
+            recommendation_type=rec["recommendation_type"],
+            trigger=rec["trigger"],
+            evidence=rec["evidence"],
+            suggested_action=rec["suggested_action"],
+            block_timestamp=rec["timestamp"],
+        )
+        logged.append(recommendations_store.get_recommendation(conn, rec_id))
+
+    return {"generated": len(logged), "recommendations": logged}
+
+
+@app.get("/recommendations")
+def recommendations_list(plant_id: str | None = None, status: str | None = None):
+    """List logged recommendations (roadmap P2.6), newest first. Filter
+    with ?plant_id=... and/or ?status=pending|approved|dismissed."""
+    conn = get_recommendations_db()
+    return {"recommendations": recommendations_store.list_recommendations(conn, plant_id=plant_id, status=status)}
+
+
+@app.post("/recommendations/{recommendation_id}/decide")
+def recommendations_decide(recommendation_id: int, request: RecommendationDecisionRequest):
+    """
+    Record a human operator's explicit approve/dismiss decision on a
+    recommendation (roadmap P2.6). This only logs the decision -- it
+    never itself revises a schedule, moves a battery, or does anything
+    else; that action, if taken, happens outside this platform, by the
+    operator, exactly as the roadmap requires ("never automatic
+    control").
+    """
+    conn = get_recommendations_db()
+    try:
+        return recommendations_store.decide_recommendation(
+            conn, recommendation_id, request.decision, request.decided_by, request.note
+        )
+    except KeyError as e:
+        raise HTTPException(status_code=404, detail=str(e))
+    except ValueError as e:
+        raise HTTPException(status_code=422, detail=str(e))
+
+
+@app.post("/reports/weekly")
+def reports_weekly(request: WeeklyReportRequest):
+    """
+    Score a batch of already-served forecasts against their now-known
+    actual outcomes (roadmap P2.9), broken down by lead time (horizon)
+    and time of day (block), against the same three untrained baselines
+    used in this project's own training-time evaluation
+    (src/evaluation/baselines.py, shared with benchmark.py so both use
+    identical math). Every number here is traced directly to the
+    `readings`/`forecasts` given -- nothing is estimated or assumed.
+    """
+    try:
+        plant_config = get_plant_config(request.plant_id)
+    except FileNotFoundError as e:
+        raise HTTPException(status_code=404, detail=str(e))
+
+    try:
+        timestamps = build_timestamp_index([r.timestamp for r in request.readings])
+        raw = pd.DataFrame(
+            [{
+                "hour": ts.hour,
+                "month": ts.month,
+                "cloud_cover": r.cloud_cover,
+                "shortwave_radiation": r.shortwave_radiation,
+                "temperature_2m": r.temperature_2m,
+                "relative_humidity_2m": r.relative_humidity_2m,
+                "wind_speed_10m": r.wind_speed_10m,
+                "solar_output_mw": r.solar_output_mw,
+            } for r, ts in zip(request.readings, timestamps)],
+            index=timestamps,
+        )
+        features = build_features(raw, plant_config)
+
+        forecasts_df = pd.DataFrame([{
+            "target_timestamp": f.target_timestamp,
+            "horizon_hours": f.horizon_hours,
+            "predicted_mw": f.predicted_mw,
+        } for f in request.forecasts])
+
+        report = generate_weekly_report(forecasts_df, features, plant_config)
+        return report.to_dict()
+    except ValueError as e:
+        raise HTTPException(status_code=422, detail=str(e))
+    except Exception as e:
+        logger.error(f"Weekly report error: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/plants", response_model=PlantOnboardingResponse, status_code=201)
+def onboard_plant(request: PlantOnboardingRequest):
+    """
+    Self-serve plant onboarding (roadmap P2.3): "self-serve capture of
+    everything in P1.1 plus COD, module type, inverter count, grid export
+    limit." Acceptance criterion: "a new plant is live in under 30
+    minutes without your involvement" -- this endpoint writes
+    configs/plants/<plant_id>.yaml directly, the exact file every other
+    endpoint already reads via get_plant_config(), so a freshly onboarded
+    plant is immediately usable by GET /plants and every other endpoint,
+    with no restart and no code change.
+
+    SCOPED TO CONFIGURATION, NOT DATA: does not depend on roadmap P2.1
+    (CSV/Excel historical data upload, not yet built -- blocked on real
+    customer files). This only captures the plant metadata every
+    endpoint's plant_config argument needs; a freshly onboarded plant has
+    no historical generation data of its own until P2.1 exists or a
+    caller supplies readings directly (e.g. to POST /quality/check).
+
+    CREATE-ONLY: 409 if plant_id is already registered. There is no
+    update/edit endpoint -- get_plant_config() is @lru_cache'd, and
+    safely invalidating that cache for an in-place edit is future scope
+    (see README Known Gaps).
+
+    grid.export_limit_mw IS enforced, not just stored: POST /optimize
+    reads it and caps dispatch via a curtailment mechanism in
+    src/optimization/battery_optimizer.py.
+    """
+    try:
+        config = register_plant(
+            plant_id=request.plant_id,
+            name=request.name,
+            location=request.location.model_dump(),
+            capacity=request.capacity.model_dump(),
+            grid=request.grid.model_dump(),
+            equipment=request.equipment.model_dump(),
+            regulatory=request.regulatory.model_dump(),
+        )
+    except PlantAlreadyRegisteredError as e:
+        raise HTTPException(status_code=409, detail=str(e))
+    except ValueError as e:
+        raise HTTPException(status_code=422, detail=str(e))
+    except Exception as e:
+        logger.error(f"Plant onboarding failed for {request.plant_id!r}: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+    return PlantOnboardingResponse(
+        plant_id=config["plant_id"],
+        config_path=f"configs/plants/{config['plant_id']}.yaml",
+        plant_config=config,
+    )
+
+
+@app.get("/plants/{plant_id}")
+def plant_detail(plant_id: str):
+    """
+    Detail view for one configured plant (roadmap P2.3) -- the read-side
+    complement to GET /plants (lists IDs only) and POST /plants (creates
+    one). Returns exactly what get_plant_config() returns, i.e. exactly
+    what every forecasting/optimization/regulatory endpoint already reads
+    for this plant_id -- the fastest way to confirm a freshly onboarded
+    plant is really live.
+    """
+    try:
+        return get_plant_config(plant_id)
+    except FileNotFoundError as e:
+        raise HTTPException(status_code=404, detail=str(e))

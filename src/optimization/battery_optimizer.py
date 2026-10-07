@@ -65,6 +65,23 @@ DSM MODE (roadmap P1.7): `deviation_penalty_per_mwh` above is a flat
   inflating both segment-1 variables together is objective-value-neutral,
   and an unconstrained LP could report a nonsensical split even though
   the true net deviation is unambiguous.
+
+EXPORT LIMIT / CURTAILMENT (roadmap P2.3): `export_limit_mw`, when given,
+  is a hard cap on power actually delivered to the grid — a real
+  contractual/regulatory constraint that may be BELOW the plant's own AC
+  capacity. Without a curtailment variable, capping grid_delivered
+  directly could make the LP infeasible whenever solar generation alone
+  (plus whatever dispatch is otherwise required) exceeds the cap and the
+  battery can't absorb the difference by charging. A `curtail` variable
+  (0 to that block's own solar forecast) is introduced ONLY when
+  export_limit_mw is set, so every existing caller that doesn't set it
+  gets an identical LP to before — no new variables, no new constraints,
+  no behavior change. A small `curtailment_cost_per_mwh` in the objective
+  doesn't make curtailment optional (the hard constraint forces it
+  whenever physically necessary regardless of cost) — it just stops the
+  LP curtailing MORE than the constraint strictly requires when multiple
+  equally-feasible solutions exist, the same reason `cycling_cost_per_mwh`
+  exists.
 """
 
 import datetime as _dt
@@ -101,6 +118,8 @@ class BatteryOptimizer:
         dsm_available_capacity_mw: float | None = None,
         dsm_seller_category: str = "solar",
         dsm_as_of: _dt.date | None = None,
+        export_limit_mw: float | None = None,
+        curtailment_cost_per_mwh: float = 2.0,
     ):
         self.capacity        = battery_capacity_mwh
         self.charge_rate     = charge_rate_mw
@@ -129,6 +148,14 @@ class BatteryOptimizer:
         )
         self.cycling_cost_per_mwh      = cycling_cost_per_mwh
         self.deviation_penalty_per_mwh = deviation_penalty_per_mwh
+
+        # Grid export cap (roadmap P2.3): a real, contractual/regulatory
+        # limit on power flowing to the grid, which may be LESS than
+        # capacity.ac_capacity_mw. None (the default) means no cap --
+        # every existing caller that doesn't pass this gets EXACTLY the
+        # same LP as before (no new variables, no new constraints).
+        self.export_limit_mw = export_limit_mw
+        self.curtailment_cost_per_mwh = curtailment_cost_per_mwh
 
         # DSM mode (roadmap P1.7) is opt-in: both a real contract rate and
         # a real available capacity must be supplied, or this falls back
@@ -181,6 +208,20 @@ class BatteryOptimizer:
         # physically impossible, not just rate-limited.
         is_charging = [pulp.LpVariable(f"is_charging_{t}", cat="Binary") for t in range(n)]
 
+        # Export limit / curtailment (roadmap P2.3) -- only created when a
+        # real cap is configured, so every existing caller that doesn't
+        # set export_limit_mw gets an LP with zero new variables/
+        # constraints (see module docstring).
+        export_capped = self.export_limit_mw is not None
+        if export_capped:
+            curtail = [
+                pulp.LpVariable(f"curtail_{t}", 0, max(0.0, float(solar_forecast[t])))
+                for t in range(n)
+            ]
+            curtailment_term = self.curtailment_cost_per_mwh * pulp.lpSum(curtail) * self.dt_hours
+        else:
+            curtailment_term = 0
+
         cycling_term = self.cycling_cost_per_mwh * pulp.lpSum(
             charge[t] + discharge[t] for t in range(n)
         ) * self.dt_hours
@@ -214,13 +255,13 @@ class BatteryOptimizer:
                 - (over1[t] * over_rates[0] + over2[t] * over_rates[1] + over3[t] * over_rates[2])
                 for t in range(n)
             )
-            prob += dsm_term + cycling_term
+            prob += dsm_term + cycling_term + curtailment_term
         else:
             # |grid_delivered - declared_schedule| via the standard LP split.
             deviation = [pulp.LpVariable(f"deviation_{t}", 0, None) for t in range(n)]
             prob += (
                 self.deviation_penalty_per_mwh * pulp.lpSum(deviation) * self.dt_hours
-                + cycling_term
+                + cycling_term + curtailment_term
             )
 
         for t in range(n):
@@ -244,7 +285,11 @@ class BatteryOptimizer:
             prob += discharge[t] <= self.discharge_rate * (1 - is_charging[t])
 
             # DSM exposure: actual delivered vs. declared schedule.
-            grid_delivered = solar + discharge[t] - charge[t]
+            if export_capped:
+                grid_delivered = solar - curtail[t] + discharge[t] - charge[t]
+                prob += grid_delivered <= self.export_limit_mw
+            else:
+                grid_delivered = solar + discharge[t] - charge[t]
             if self.dsm_enabled:
                 # over/under segments are block ENERGY (MWh, matching
                 # dsm.lp_cost_segments' available_capacity_mwh convention)
@@ -274,9 +319,10 @@ class BatteryOptimizer:
             c = max(0.0, pulp.value(charge[t]) or 0.0)
             d = max(0.0, pulp.value(discharge[t]) or 0.0)
             bl = pulp.value(battery_level[t]) or 0.0
+            cur = max(0.0, pulp.value(curtail[t]) or 0.0) if export_capped else 0.0
             s = float(solar_forecast[t])
             sched = float(declared_schedule_mw[t])
-            grid_delivered = s + d - c
+            grid_delivered = s - cur + d - c
 
             action = "CHARGE" if c > 0.5 else ("DISCHARGE" if d > 0.5 else "HOLD")
 
@@ -286,6 +332,7 @@ class BatteryOptimizer:
                 "surplus_mw": round(s - sched, 2),
                 "charge_mw": round(c, 2),
                 "discharge_mw": round(d, 2),
+                "curtailed_mw": round(cur, 2),
                 "battery_level_mwh": round(bl, 2),
                 "grid_balance_mw": round(grid_delivered - sched, 2),
                 "deviation_mwh": round(abs(grid_delivered - sched) * self.dt_hours, 3),
@@ -345,12 +392,21 @@ class BatteryOptimizer:
                 action = "HOLD"
 
             grid_delivered = s + discharge_amt - charge_amt
+            # Export limit (roadmap P2.3): the fallback has no LP to add a
+            # constraint to, so it curtails greedily -- whatever's left
+            # over export_limit_mw after charge/discharge decisions are
+            # already made, matching the LP's own hard cap.
+            curtail_amt = 0.0
+            if self.export_limit_mw is not None and grid_delivered > self.export_limit_mw:
+                curtail_amt = grid_delivered - self.export_limit_mw
+                grid_delivered = self.export_limit_mw
             row = {
                 "solar_mw": round(s, 2),
                 "declared_schedule_mw": round(sched, 2),
                 "surplus_mw": round(surplus, 2),
                 "charge_mw": round(charge_amt, 2),
                 "discharge_mw": round(discharge_amt, 2),
+                "curtailed_mw": round(curtail_amt, 2),
                 "battery_level_mwh": round(battery, 2),
                 "grid_balance_mw": round(grid_delivered - sched, 2),
                 "deviation_mwh": round(abs(grid_delivered - sched) * self.dt_hours, 3),
