@@ -4,9 +4,10 @@ services:
     build: .
     command: uvicorn src.api.main:app --host 0.0.0.0 --port 8000
     environment:
-      # Comma-separated browser origins allowed to call the API (the
-      # frontend). Never "*" -- set the real frontend origin per deploy.
-      CORS_ALLOW_ORIGINS: "http://localhost:5173,http://127.0.0.1:5173"
+      # Comma-separated browser origins allowed to call the API directly.
+      # Never "*". (The web service below reaches the API through its own
+      # nginx /api proxy, i.e. same-origin, so it needs no entry here.)
+      ZENITH_CORS_ORIGINS: "http://localhost:5173,http://127.0.0.1:5173,http://localhost:8080"
     ports:
       - "8000:8000"
     healthcheck:
@@ -20,3 +21,12 @@ services:
     build: .
     ports:
       - "8501:8501"
+
+  # Web console (web/) -- static React build behind nginx, which also
+  # proxies /api/* to the api service above. Open http://localhost:8080
+  web:
+    build: ./web
+    ports:
+      - "8080:8080"
+    depends_on:
+      - api

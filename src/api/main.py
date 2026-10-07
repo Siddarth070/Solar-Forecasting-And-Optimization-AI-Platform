@@ -75,20 +75,19 @@ app = FastAPI(
     version="1.0.0"
 )
 
-# ── CORS (browser frontend, frontend/) ────────────────────────
-# Explicit allow-list, never "*": set CORS_ALLOW_ORIGINS to a comma-
-# separated list of origins in each deployment. Defaults cover the
-# frontend's local dev servers only.
+# ── CORS (web console, web/) ──────────────────────────────────
+# The web console is a separate static site, so the browser needs an
+# explicit allow-list -- never "*". Set ZENITH_CORS_ORIGINS (comma-
+# separated) in every deployment; the defaults cover local dev only.
+_DEFAULT_ORIGINS = "http://localhost:5173,http://127.0.0.1:5173,http://localhost:8080"
 CORS_ALLOW_ORIGINS = [
-    o.strip() for o in os.environ.get(
-        "CORS_ALLOW_ORIGINS", "http://localhost:5173,http://127.0.0.1:5173"
-    ).split(",") if o.strip()
+    o.strip() for o in os.getenv("ZENITH_CORS_ORIGINS", _DEFAULT_ORIGINS).split(",") if o.strip()
 ]
 app.add_middleware(
     CORSMiddleware,
     allow_origins=CORS_ALLOW_ORIGINS,
     allow_methods=["GET", "POST"],
-    allow_headers=["Content-Type", "Authorization"],
+    allow_headers=["Content-Type", "X-API-Key"],
 )
 
 # ── Load model on startup ─────────────────────────────────────
@@ -165,7 +164,14 @@ class ForecastResponse(BaseModel):
     peak_output_mw     : float
     peak_index         : int = Field(description="Position in predictions_mw/timestamps of the peak.")
     peak_timestamp     : str
-    total_generation_mwh: float
+    total_generation_mwh: float = Field(
+        description="Energy over the request: sum(MW) x interval_hours. "
+                     "Correct for hourly AND 15-minute inputs."
+    )
+    interval_hours     : float = Field(
+        description="Spacing between the request's timestamps, in hours "
+                     "(0.25 for a 96-block day, 1.0 for hourly)."
+    )
     generated_at       : str
     predictions_p10_mw : list[float] = Field(
         default_factory=list,
@@ -841,6 +847,14 @@ def forecast(request: ForecastRequest):
 
         peak_idx = int(np.argmax(predictions))
 
+        # Energy = power x duration. Summing MW only equals MWh for hourly
+        # inputs -- a 96-block (15-min) request used to report 4x the true
+        # energy. Use the median spacing; a single timestamp is 1 hour.
+        if len(timestamps) > 1:
+            interval_hours = float(np.median(timestamps.to_series().diff().dropna().dt.total_seconds()) / 3600)
+        else:
+            interval_hours = 1.0
+
         logger.info(
             f"Forecast generated: {len(predictions)} hours, "
             f"peak {max(predictions):.1f} MW at {timestamps[peak_idx].isoformat()}"
@@ -859,7 +873,8 @@ def forecast(request: ForecastRequest):
             peak_output_mw      = round(max(predictions), 2),
             peak_index          = peak_idx,
             peak_timestamp      = timestamps[peak_idx].isoformat(),
-            total_generation_mwh= round(sum(predictions), 2),
+            total_generation_mwh= round(sum(predictions) * interval_hours, 2),
+            interval_hours      = interval_hours,
             generated_at        = datetime.now().isoformat(),
             predictions_p10_mw  = p10_mw,
             predictions_p50_mw  = p50_mw,

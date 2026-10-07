@@ -130,6 +130,16 @@ a single `docker run` gets the standalone dashboard only.
 
 ---
 
+## Web console (`web/`)
+
+A React front end that drives the API end to end: 96-block forecast with
+P10–P90, a declaration chooser that prices DSM loss for each declaration
+under low/median/high days, battery dispatch, intraday revision timing, and
+a CSV export of the schedule. See `web/README.md`. Run everything with
+`docker compose up --build` and open http://localhost:8080.
+
+---
+
 ## Project Structure
 
 ```
@@ -479,8 +489,8 @@ the moment real data lands.
 | POST | `/schedule/revise` | Apply a revision under IEGC 2023 gate-closure timing |
 | GET | `/schedule/gate-closures` | Next bilateral-revision and RTM gate-closure instants |
 
-Browser access is restricted to the origins in `CORS_ALLOW_ORIGINS`
-(comma-separated; defaults to the local frontend dev server).
+Browser access is restricted to the origins in `ZENITH_CORS_ORIGINS`
+(comma-separated; defaults to the local web-console dev servers only).
 
 ## Known Gaps
 

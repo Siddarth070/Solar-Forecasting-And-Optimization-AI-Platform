@@ -1,0 +1,13 @@
+# Netlify: set the site's base directory to `web`.
+# Netlify serves only the static site. The FastAPI service must be hosted
+# separately (Render, Railway, Fly, a VM); point the build at it with the
+# VITE_API_URL environment variable in Netlify's site settings, and add
+# the Netlify domain to the API's ZENITH_CORS_ORIGINS.
+[build]
+  command = "npm ci && npm run build"
+  publish = "dist"
+
+[[redirects]]
+  from = "/*"
+  to = "/index.html"
+  status = 200
