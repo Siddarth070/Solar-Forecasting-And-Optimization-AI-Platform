@@ -39,10 +39,6 @@ pulp==3.3.2              # Used by src/optimization/battery_optimizer.py
 fastapi==0.141.1
 uvicorn==0.53.0
 
-# ── Dashboard ─────────────────────────────────────────────────
-streamlit==1.64.0
-plotly==7.1.0
-
 # ── Testing ─────────────────────────────────────────────────
 pytest==9.1.1
 pytest-cov==7.1.0

@@ -19,22 +19,19 @@ jobs:
           echo "container user: $user"
           test "$user" = "appuser"
 
-      - name: Bring up API + dashboard via docker compose
+      - name: Bring up the API via docker compose
         run: docker compose up --build -d
 
-      - name: Wait for both services to become healthy
+      - name: Wait for the API to become healthy
         run: |
           for i in $(seq 1 30); do
-            api_ok=false; dash_ok=false
-            curl -sf http://localhost:8000/health > /dev/null && api_ok=true
-            curl -sf http://localhost:8501/_stcore/health > /dev/null && dash_ok=true
-            if $api_ok && $dash_ok; then
-              echo "both services healthy"
+            if curl -sf http://localhost:8000/health > /dev/null; then
+              echo "api healthy"
               exit 0
             fi
             sleep 2
           done
-          echo "services did not become healthy in time"
+          echo "api did not become healthy in time"
           docker compose logs
           exit 1
 

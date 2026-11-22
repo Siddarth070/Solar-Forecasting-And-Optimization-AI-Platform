@@ -25,13 +25,14 @@ curtailment, idle backup capacity, and DSM/deviation penalties.
 - A single XGBoost model producing an **hourly point forecast** of solar
   output (no ensemble, no quantile/uncertainty bands, no 15-minute
   granularity yet — those are aspirational, not built).
-- A feature pipeline (`src/features/pipeline.py`) shared by training, the
-  API, and the dashboard, so all three compute features identically.
-- A battery dispatch step: the deployed dashboard uses a simple rule-based
-  charge/discharge heuristic; a PuLP-based linear-program optimizer exists
-  in `src/optimization/` but is not wired into the live dashboard and has
-  known modeling gaps (no round-trip efficiency, hourly-only blocks — see
-  Known Gaps).
+- A feature pipeline (`src/features/pipeline.py`) shared by training and
+  the API, so both compute features identically.
+- A battery dispatch step: a PuLP-based linear-program optimizer in
+  `src/optimization/`, exposed through the API (`POST /optimize`) — see
+  Known Gaps.
+- No web frontend yet. The earlier Streamlit prototype has been removed;
+  the product is served through the FastAPI service (`src/api/`) while a
+  production web app is built.
 - A reproducible training + evaluation pipeline (`make train`,
   `benchmark.py`) — see Honest Results below for what it actually measures.
 
@@ -111,22 +112,17 @@ docstring gives the exact download commands to reproduce this.
 ## Architecture
 
 ```
-Open-Meteo (live weather, dashboard) ──┐
-                                        ↓
-              src/features/pipeline.py (shared: training, API, dashboard)
-                                        ↓
-              XGBoost model (src/models/xgboost_solar_v2.json)
-                                        ↓
-         ┌──────────────────────────────────────────┐
-         ↓                                            ↓
-  Standalone Streamlit dashboard              FastAPI service (src/api/)
-  (rule-based battery optimizer inline)       (not part of the live deploy)
+Open-Meteo (live weather) ──┐
+                             ↓
+   src/features/pipeline.py (shared: training, API)
+                             ↓
+   XGBoost model (src/models/xgboost_solar_v2.json)
+                             ↓
+          FastAPI service (src/api/)
 ```
 
-The deployed dashboard (`dashboard/app.py`) runs standalone — it loads the
-model and calls Open-Meteo directly, with no FastAPI hop. `docker compose
-up` runs both the dashboard and the API together (see `docker-compose.yml`);
-a single `docker run` gets the standalone dashboard only.
+`docker compose up` (or a single `docker run`) starts the FastAPI service
+on port 8000.
 
 ---
 
@@ -139,13 +135,12 @@ a single `docker run` gets the standalone dashboard only.
 │   └── plants/         # One YAML per plant (location, capacity) — see src/utils/config_loader.get_plant_config
 ├── src/
 │   ├── ingestion/      # Open-Meteo fetcher, Jaipur data simulator, synthetic forecast-error model
-│   ├── features/       # pipeline.py — the one feature implementation (training, API, dashboard all import it)
+│   ├── features/       # pipeline.py — the one feature implementation (training and API both import it)
 │   ├── models/         # train.py, model_card.py, the served model + its model card
-│   ├── optimization/   # PuLP-based battery dispatch optimizer (not yet wired into the live dashboard)
+│   ├── optimization/   # PuLP-based battery dispatch optimizer
 │   ├── regulatory/     # dsm.py (DSM charges) + grid_code.py (revision/gate-closure timing) — real CERC rules
 │   ├── scheduling/     # rolling_horizon.py — applies a schedule revision under grid_code.py's gate-closure timing
-│   └── api/            # FastAPI service (standalone — not used by the deployed dashboard)
-├── dashboard/          # Standalone Streamlit app — this is what's deployed
+│   └── api/            # FastAPI service
 ├── notebooks/          # Archived exploration — see notebooks/README.md (not served, roadmap P1.8)
 ├── benchmark.py         # Honest evaluation: rolling-origin backtest + baselines
 ├── Makefile             # make train / make benchmark / make test
@@ -171,10 +166,10 @@ make train
 # Score it honestly against baselines
 make benchmark
 
-# Run the dashboard locally
-streamlit run dashboard/app.py
+# Run the API locally
+uvicorn src.api.main:app --reload
 
-# Or run both the dashboard and the API together
+# Or run it in Docker
 docker compose up --build
 
 # Run tests
@@ -192,16 +187,16 @@ any new feature work. As of this commit:
 
 - **Phase 0, done:** target leakage removed and tested in CI; one shared
   feature pipeline (no more hand-duplicated feature dicts in the
-  API/dashboard); a feature/serving parity test; the honest evaluation
+  API); a feature/serving parity test; the honest evaluation
   harness above; model-skill vs. deliverable-skill split; reproducible
   training (`make train`, JSON model format, `model_card.json`); Docker
-  build fixed (non-root, both services start, verified in CI);
+  build fixed (non-root, service starts, verified in CI);
   dependencies fully pinned.
 - **Phase 1, partially done:** per-plant configuration (`configs/plants/`
   — two plants in two states run from the same binary, tested in CI; the
   model trains on capacity FRACTION so one artifact correctly serves
-  differently-sized plants); the dashboard's fake sine-wave "demand"
-  curve replaced with an operator-set declared schedule; a resolution-
+  differently-sized plants); the fake sine-wave "demand" curve
+  replaced with an operator-set declared schedule; a resolution-
   independent 96-block/15-minute time engine (`src/time_blocks.py`,
   matching India's real grid-scheduling grid); the battery optimizer
   rewritten as a proper LP with round-trip efficiency, SOC floor/ceiling,
@@ -209,8 +204,7 @@ any new feature work. As of this commit:
   exposure (deviation from the declared schedule) in both directions,
   not "unmet demand" only; probabilistic P10/P50/P90 forecasts (a second
   XGBoost model with a multi-output quantile objective, served alongside
-  the point forecast in `/forecast` and shown as an uncertainty band on
-  the dashboard), validated with pinball loss and a reliability check on
+  the point forecast in `/forecast`), validated with pinball loss and a reliability check on
   the final holdout (see `src/models/model_card.json`'s
   `quantile_final_holdout`); a config-driven DSM ruleset
   (`src/regulatory/dsm.py`) implementing the real CERC (Deviation
@@ -220,8 +214,7 @@ any new feature work. As of this commit:
   docstring for full citations and the one real gap it documents rather
   than fabricates: CERC's post-01.04.2026 deviation-% blend weight is not
   yet published), wired into the battery LP's objective (`POST
-  /optimize?plant_id=...`) and reported (not yet optimized-for) on the
-  dashboard; rolling day-ahead/intraday horizons (`src/regulatory/
+  /optimize?plant_id=...`); rolling day-ahead/intraday horizons (`src/regulatory/
   grid_code.py`, `src/scheduling/rolling_horizon.py`) implementing the
   real CERC Indian Electricity Grid Code (IEGC) 2023 Regulation 49(4)(c)
   gate-closure rule — a requested schedule revision only takes effect 6-7
@@ -356,15 +349,13 @@ any new feature work. As of this commit:
   persistence/smart_persistence carry an exact, known error) — plus 5
   end-to-end API tests.
   A self-serve plant onboarding flow (`src/onboarding/plant_registration.py`,
-  `POST /plants`, `GET /plants/{plant_id}`, plus a matching form in the
-  Streamlit dashboard — roadmap P2.3) that writes a brand-new
+  `POST /plants`, `GET /plants/{plant_id}` — roadmap P2.3) that writes a brand-new
   `configs/plants/<plant_id>.yaml` directly, the same file every other
   endpoint already reads via `get_plant_config()`, so a freshly onboarded
   plant is live for every existing endpoint immediately, with no restart
   and no code change — proven end-to-end in tests by onboarding a plant
   and calling `POST /quality/check` and `POST /schedule/risk` against it
-  in the same test, and manually in the dashboard by onboarding a plant
-  through the real form and watching it appear in the plant selector.
+  in the same test.
   Captures everything roadmap P1.1's schema holds plus the four fields
   P2.3 adds: commercial operation date, module type, inverter count, and
   a grid export-limit cap (`grid.export_limit_mw`, finally giving the
@@ -471,12 +462,6 @@ the moment real data lands.
   config/serving layer is plant-agnostic, not that a real Pune-trained
   model exists. That needs a location-aware simulator or real per-plant
   data (Phase 3).
-- The deployed dashboard's battery optimizer is still a simple rule-based
-  heuristic, not the PuLP linear program in `src/optimization/` (which now
-  has round-trip efficiency, SOC floor/ceiling, a terminal SOC constraint,
-  and the real CERC DSM charge structure) — wiring the dashboard to call
-  the real LP is not done yet; it only *reports* an estimated DSM cost for
-  its own heuristic's dispatch, using `src/regulatory/dsm.py`.
 - `contract_rate_rs_per_kwh` in `configs/plants/*.yaml` is an illustrative
   placeholder (Rs 2.50/kWh), not a real PPA/auction tariff — these are
   simulated demo plants with no real commercial contract to cite. The DSM
@@ -569,7 +554,7 @@ the moment real data lands.
   not an actual deployed schedule.
 - Plant onboarding (`POST /plants`, roadmap P2.3) is **create-only** —
   there is no way to edit or update an already-registered plant's config
-  through the API or the dashboard form. `configs/plants/*.yaml` can
+  through the API. `configs/plants/*.yaml` can
   still be hand-edited on disk as before, but `get_plant_config()`'s
   `@lru_cache` means a running server won't see a hand-edit until its
   cache is cleared or it restarts — a real update endpoint needs a real
@@ -577,7 +562,7 @@ the moment real data lands.
   authentication or multi-tenancy anywhere (this platform remains
   explicitly single-tenant — roadmap P2.11's multi-tenant rewrite depends
   on P2.3 finishing first, not the other way around) — anyone who can
-  reach the API or the dashboard can register a plant. Onboarding a
+  reach the API can register a plant. Onboarding a
   plant's *configuration* is entirely separate from roadmap P2.1 (real
   customer CSV/Excel data upload), which remains not started — a freshly
   onboarded plant has zero historical generation data of its own until
@@ -598,7 +583,6 @@ the moment real data lands.
 **Forecasting:** XGBoost, pvlib (solar-position clear-sky modeling)
 **Optimization:** PuLP
 **API:** FastAPI
-**Dashboard:** Streamlit
 **Infrastructure:** Docker, Docker Compose, GitHub Actions CI
 
 ---
@@ -620,7 +604,7 @@ later step):
 
 ## Data Sources
 
-- [Open-Meteo](https://open-meteo.com) — free hourly weather forecasts, used live by the dashboard. No API key required.
+- [Open-Meteo](https://open-meteo.com) — free hourly weather forecasts, used live by the API. No API key required.
 - `src/ingestion/jaipur_simulator.py` — the actual source of training data today: a seeded, deterministic synthetic generator (see Honest Results above for its limitations).
 
 ---
@@ -628,8 +612,3 @@ later step):
 *Built as a portfolio project demonstrating end-to-end, honestly-evaluated
 ML engineering for the Indian energy sector. Target location for the
 current simulation: Jaipur, Rajasthan.*
-
-## Live Demo
-👉 [Open Dashboard](https://zenith-to.streamlit.app/) — trained entirely on
-synthetic data (see Honest Results above); not yet validated against a
-real plant.
