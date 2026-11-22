@@ -1,7 +1,7 @@
 # Archived exploration — not part of the product
 
 Everything in this directory is exploratory work, kept as an appendix.
-None of it runs in the served product (`src/`, `dashboard/`, `benchmark.py`).
+None of it runs in the served product (`src/`, `benchmark.py`).
 
 Per roadmap P1.8: **the product path is one model family — XGBoost.**
 LSTM and Prophet were explored here and are retired from the product:

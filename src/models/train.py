@@ -12,7 +12,7 @@ WHY THIS EXISTS:
 
 WHAT IT TRAINS ON:
   Only SERVING_FEATURE_COLUMNS — weather + time-of-day + clear_sky_index.
-  Lag/rolling features are deliberately excluded: a live dashboard/API
+  Lag/rolling features are deliberately excluded: a live API
   request is a one-shot weather forecast with no access to the plant's
   actual past generation, so a model trained to expect solar_lag_1h etc.
   could never be honestly served (see src/features/pipeline.py).
@@ -115,7 +115,7 @@ def train():
     # nearly identical to jaipur_100mw's ~49 MW, because the model has no
     # notion of "this plant's capacity" — only clipping at the ceiling
     # papers over it). Serving code multiplies back by the REQUESTED plant's
-    # capacity (src/api/main.py, dashboard/app.py), so one model genuinely
+    # capacity (src/api/main.py), so one model genuinely
     # generalizes across differently-sized plants.
     featured[TARGET_COLUMN] = featured[TARGET_COLUMN] / capacity_mw
 

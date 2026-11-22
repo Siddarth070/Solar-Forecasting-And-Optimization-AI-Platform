@@ -50,7 +50,7 @@ FEATURE_COLUMNS = [
 ]
 
 # The subset the SERVED model actually trains and predicts on. A live
-# dashboard/API request is a one-shot weather forecast with no access to
+# API request is a one-shot weather forecast with no access to
 # the plant's actual past generation (there is no per-plant history store
 # yet — that's P1.1+), so solar_lag_*/solar_rolling_* can never be
 # honestly computed at serving time. Per roadmap checklist item 9, an

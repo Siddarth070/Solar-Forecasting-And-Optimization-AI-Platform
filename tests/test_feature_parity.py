@@ -4,8 +4,8 @@ test_feature_parity.py
 Guards against train/serve skew (audit finding F2): the served model must
 always expect exactly the columns build_features() actually produces for
 a live request, in the same order. XGBoost's sklearn API already raises
-if the names mismatch (see src/api/main.py / dashboard/app.py, which both
-call build_features(...)[SERVING_FEATURE_COLUMNS] before predict()) — this
+if the names mismatch (see src/api/main.py, which calls
+build_features(...)[SERVING_FEATURE_COLUMNS] before predict()) — this
 test exists so that a mismatch is caught by `pytest` in CI, on the very
 next commit that touches either side, rather than as a 500 in production.
 
@@ -38,8 +38,7 @@ def _served_model():
 
 
 def _representative_request_frame() -> pd.DataFrame:
-    """A frame shaped exactly like what src/api/main.py and
-    dashboard/app.py hand to build_features() for a live request: no
+    """A frame shaped exactly like what src/api/main.py hands to build_features() for a live request: no
     solar_output_mw (a live weather forecast never has it)."""
     index = pd.date_range("2024-06-01", periods=24, freq="h", tz="Asia/Kolkata")
     return pd.DataFrame(
